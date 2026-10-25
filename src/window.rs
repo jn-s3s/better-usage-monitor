@@ -3230,35 +3230,37 @@ fn render_layered() {
         // sub-pixel font rendering that matches the rest of the OS.
         paint_content(
             mem_dc,
-            width,
-            height,
-            is_dark,
-            appearance,
-            &bg_color,
-            &text_color,
-            &accent,
-            &track,
-            language,
-            strings,
-            session_pct,
-            &session_text,
-            weekly_pct,
-            &weekly_text,
-            codex_session_pct,
-            &codex_session_text,
-            codex_weekly_pct,
-            &codex_weekly_text,
-            antigravity_session_pct,
-            &antigravity_session_text,
-            antigravity_weekly_pct,
-            &antigravity_weekly_text,
-            show_claude_code,
-            show_codex,
-            show_antigravity,
-            show_session_window,
-            show_weekly_window,
-            &codex_accent,
-            &antigravity_accent,
+            WidgetContent {
+                width,
+                height,
+                is_dark,
+                appearance,
+                bg: &bg_color,
+                text_color: &text_color,
+                accent: &accent,
+                track: &track,
+                language,
+                strings,
+                session_pct,
+                session_text: &session_text,
+                weekly_pct,
+                weekly_text: &weekly_text,
+                codex_session_pct,
+                codex_session_text: &codex_session_text,
+                codex_weekly_pct,
+                codex_weekly_text: &codex_weekly_text,
+                antigravity_session_pct,
+                antigravity_session_text: &antigravity_session_text,
+                antigravity_weekly_pct,
+                antigravity_weekly_text: &antigravity_weekly_text,
+                show_claude_code,
+                show_codex,
+                show_antigravity,
+                show_session_window,
+                show_weekly_window,
+                codex_accent: &codex_accent,
+                antigravity_accent: &antigravity_accent,
+            },
         );
 
         // System mode blends with the taskbar. High contrast modes use a solid
@@ -3312,39 +3314,71 @@ fn render_layered() {
     }
 }
 
-/// Paint all widget content onto a DC with a given background color.
-fn paint_content(
-    hdc: HDC,
+struct WidgetContent<'a> {
     width: i32,
     height: i32,
     is_dark: bool,
     appearance: Appearance,
-    bg: &Color,
-    text_color: &Color,
-    accent: &Color,
-    track: &Color,
+    bg: &'a Color,
+    text_color: &'a Color,
+    accent: &'a Color,
+    track: &'a Color,
     language: LanguageId,
     strings: Strings,
     session_pct: f64,
-    session_text: &str,
+    session_text: &'a str,
     weekly_pct: f64,
-    weekly_text: &str,
+    weekly_text: &'a str,
     codex_session_pct: f64,
-    codex_session_text: &str,
+    codex_session_text: &'a str,
     codex_weekly_pct: f64,
-    codex_weekly_text: &str,
+    codex_weekly_text: &'a str,
     antigravity_session_pct: f64,
-    antigravity_session_text: &str,
+    antigravity_session_text: &'a str,
     antigravity_weekly_pct: f64,
-    antigravity_weekly_text: &str,
+    antigravity_weekly_text: &'a str,
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
     show_session_window: bool,
     show_weekly_window: bool,
-    codex_accent: &Color,
-    antigravity_accent: &Color,
-) {
+    codex_accent: &'a Color,
+    antigravity_accent: &'a Color,
+}
+
+/// Paint all widget content onto a DC with a given background color.
+fn paint_content(hdc: HDC, content: WidgetContent<'_>) {
+    let WidgetContent {
+        width,
+        height,
+        is_dark,
+        appearance,
+        bg,
+        text_color,
+        accent,
+        track,
+        language,
+        strings,
+        session_pct,
+        session_text,
+        weekly_pct,
+        weekly_text,
+        codex_session_pct,
+        codex_session_text,
+        codex_weekly_pct,
+        codex_weekly_text,
+        antigravity_session_pct,
+        antigravity_session_text,
+        antigravity_weekly_pct,
+        antigravity_weekly_text,
+        show_claude_code,
+        show_codex,
+        show_antigravity,
+        show_session_window,
+        show_weekly_window,
+        codex_accent,
+        antigravity_accent,
+    } = content;
     unsafe {
         let is_dark = appearance.is_dark(is_dark);
         let session_pct = usage_percent_for_display(language, session_pct);
@@ -3437,61 +3471,65 @@ fn paint_content(
         if show_session_window {
             draw_row(
                 hdc,
-                content_x,
-                if show_weekly_window {
-                    row1_y
-                } else {
-                    single_row_y
+                UsageRow {
+                    x: content_x,
+                    y: if show_weekly_window {
+                        row1_y
+                    } else {
+                        single_row_y
+                    },
+                    is_dark,
+                    appearance,
+                    text_color,
+                    label: strings.session_window,
+                    claude_percent: session_pct,
+                    claude_text: session_text,
+                    codex_percent: codex_session_pct,
+                    codex_text: codex_session_text,
+                    antigravity_percent: antigravity_session_pct,
+                    antigravity_text: antigravity_session_text,
+                    show_claude_code,
+                    show_codex,
+                    show_antigravity,
+                    claude_accent: accent,
+                    codex_accent,
+                    antigravity_accent,
+                    track,
+                    label_width,
+                    text_width,
                 },
-                is_dark,
-                appearance,
-                text_color,
-                strings.session_window,
-                session_pct,
-                session_text,
-                codex_session_pct,
-                codex_session_text,
-                antigravity_session_pct,
-                antigravity_session_text,
-                show_claude_code,
-                show_codex,
-                show_antigravity,
-                accent,
-                codex_accent,
-                antigravity_accent,
-                track,
-                label_width,
-                text_width,
             );
         }
         if show_weekly_window {
             draw_row(
                 hdc,
-                content_x,
-                if show_session_window {
-                    row2_y
-                } else {
-                    single_row_y
+                UsageRow {
+                    x: content_x,
+                    y: if show_session_window {
+                        row2_y
+                    } else {
+                        single_row_y
+                    },
+                    is_dark,
+                    appearance,
+                    text_color,
+                    label: strings.weekly_window,
+                    claude_percent: weekly_pct,
+                    claude_text: weekly_text,
+                    codex_percent: codex_weekly_pct,
+                    codex_text: codex_weekly_text,
+                    antigravity_percent: antigravity_weekly_pct,
+                    antigravity_text: antigravity_weekly_text,
+                    show_claude_code,
+                    show_codex,
+                    show_antigravity,
+                    claude_accent: accent,
+                    codex_accent,
+                    antigravity_accent,
+                    track,
+                    label_width,
+                    text_width,
                 },
-                is_dark,
-                appearance,
-                text_color,
-                strings.weekly_window,
-                weekly_pct,
-                weekly_text,
-                codex_weekly_pct,
-                codex_weekly_text,
-                antigravity_weekly_pct,
-                antigravity_weekly_text,
-                show_claude_code,
-                show_codex,
-                show_antigravity,
-                accent,
-                codex_accent,
-                antigravity_accent,
-                track,
-                label_width,
-                text_width,
             );
         }
 
@@ -4000,7 +4038,7 @@ fn complete_provider_poll(
             return;
         };
         let completion = s.monitor.finish(
-            &job,
+            job,
             attempt,
             Instant::now(),
             SystemTime::now(),
@@ -4983,10 +5021,12 @@ unsafe extern "system" fn wnd_proc(
                                         s.show_codex = !s.show_codex;
                                     }
                                 }
-                                IDM_MODEL_ANTIGRAVITY => {
-                                    if s.show_claude_code || s.show_codex || !s.show_antigravity {
-                                        s.show_antigravity = !s.show_antigravity;
-                                    }
+                                IDM_MODEL_ANTIGRAVITY
+                                    if s.show_claude_code
+                                        || s.show_codex
+                                        || !s.show_antigravity =>
+                                {
+                                    s.show_antigravity = !s.show_antigravity;
                                 }
                                 _ => {}
                             }
@@ -5963,35 +6003,37 @@ fn paint(hdc: HDC, hwnd: HWND) {
 
         paint_content(
             mem_dc,
-            width,
-            height,
-            is_dark,
-            appearance,
-            &bg_color,
-            &text_color,
-            &accent,
-            &track,
-            language,
-            strings,
-            session_pct,
-            &session_text,
-            weekly_pct,
-            &weekly_text,
-            codex_session_pct,
-            &codex_session_text,
-            codex_weekly_pct,
-            &codex_weekly_text,
-            antigravity_session_pct,
-            &antigravity_session_text,
-            antigravity_weekly_pct,
-            &antigravity_weekly_text,
-            show_claude_code,
-            show_codex,
-            show_antigravity,
-            show_session_window,
-            show_weekly_window,
-            &codex_accent,
-            &antigravity_accent,
+            WidgetContent {
+                width,
+                height,
+                is_dark,
+                appearance,
+                bg: &bg_color,
+                text_color: &text_color,
+                accent: &accent,
+                track: &track,
+                language,
+                strings,
+                session_pct,
+                session_text: &session_text,
+                weekly_pct,
+                weekly_text: &weekly_text,
+                codex_session_pct,
+                codex_session_text: &codex_session_text,
+                codex_weekly_pct,
+                codex_weekly_text: &codex_weekly_text,
+                antigravity_session_pct,
+                antigravity_session_text: &antigravity_session_text,
+                antigravity_weekly_pct,
+                antigravity_weekly_text: &antigravity_weekly_text,
+                show_claude_code,
+                show_codex,
+                show_antigravity,
+                show_session_window,
+                show_weekly_window,
+                codex_accent: &codex_accent,
+                antigravity_accent: &antigravity_accent,
+            },
         );
 
         let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
@@ -6002,30 +6044,54 @@ fn paint(hdc: HDC, hwnd: HWND) {
     }
 }
 
-fn draw_row(
-    hdc: HDC,
+struct UsageRow<'a> {
     x: i32,
     y: i32,
     is_dark: bool,
     appearance: Appearance,
-    text_color: &Color,
-    label: &str,
+    text_color: &'a Color,
+    label: &'a str,
     claude_percent: f64,
-    claude_text: &str,
+    claude_text: &'a str,
     codex_percent: f64,
-    codex_text: &str,
+    codex_text: &'a str,
     antigravity_percent: f64,
-    antigravity_text: &str,
+    antigravity_text: &'a str,
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
-    claude_accent: &Color,
-    codex_accent: &Color,
-    antigravity_accent: &Color,
-    track: &Color,
+    claude_accent: &'a Color,
+    codex_accent: &'a Color,
+    antigravity_accent: &'a Color,
+    track: &'a Color,
     label_width: i32,
     text_width: i32,
-) {
+}
+
+fn draw_row(hdc: HDC, row: UsageRow<'_>) {
+    let UsageRow {
+        x,
+        y,
+        is_dark,
+        appearance,
+        text_color,
+        label,
+        claude_percent,
+        claude_text,
+        codex_percent,
+        codex_text,
+        antigravity_percent,
+        antigravity_text,
+        show_claude_code,
+        show_codex,
+        show_antigravity,
+        claude_accent,
+        codex_accent,
+        antigravity_accent,
+        track,
+        label_width,
+        text_width,
+    } = row;
     let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
     let segment_count = row_bar_segment_count(active_models);
     let use_model_text_colors = active_models > 1 && appearance.palette == Palette::System;
@@ -6062,51 +6128,57 @@ fn draw_row(
         if show_claude_code {
             draw_usage_bar(
                 hdc,
-                model_x + sc(provider_icons::SIZE + provider_icons::RIGHT_MARGIN),
-                y,
-                segment_count,
-                claude_percent,
-                claude_text,
-                claude_accent,
-                track,
-                &claude_value_color,
-                text_width,
-                is_dark,
-                appearance,
+                UsageBar {
+                    bar_x: model_x + sc(provider_icons::SIZE + provider_icons::RIGHT_MARGIN),
+                    y,
+                    segment_count,
+                    percent: claude_percent,
+                    text: claude_text,
+                    accent: claude_accent,
+                    track,
+                    text_color: &claude_value_color,
+                    text_width,
+                    is_dark,
+                    appearance,
+                },
             );
             model_x += model_usage_width(segment_count, text_width) + sc(MODEL_RIGHT_MARGIN);
         }
         if show_codex {
             draw_usage_bar(
                 hdc,
-                model_x + sc(provider_icons::SIZE + provider_icons::RIGHT_MARGIN),
-                y,
-                segment_count,
-                codex_percent,
-                codex_text,
-                codex_accent,
-                track,
-                &codex_value_color,
-                text_width,
-                is_dark,
-                appearance,
+                UsageBar {
+                    bar_x: model_x + sc(provider_icons::SIZE + provider_icons::RIGHT_MARGIN),
+                    y,
+                    segment_count,
+                    percent: codex_percent,
+                    text: codex_text,
+                    accent: codex_accent,
+                    track,
+                    text_color: &codex_value_color,
+                    text_width,
+                    is_dark,
+                    appearance,
+                },
             );
             model_x += model_usage_width(segment_count, text_width) + sc(MODEL_RIGHT_MARGIN);
         }
         if show_antigravity {
             draw_usage_bar(
                 hdc,
-                model_x + sc(provider_icons::SIZE + provider_icons::RIGHT_MARGIN),
-                y,
-                segment_count,
-                antigravity_percent,
-                antigravity_text,
-                antigravity_accent,
-                track,
-                &antigravity_value_color,
-                text_width,
-                is_dark,
-                appearance,
+                UsageBar {
+                    bar_x: model_x + sc(provider_icons::SIZE + provider_icons::RIGHT_MARGIN),
+                    y,
+                    segment_count,
+                    percent: antigravity_percent,
+                    text: antigravity_text,
+                    accent: antigravity_accent,
+                    track,
+                    text_color: &antigravity_value_color,
+                    text_width,
+                    is_dark,
+                    appearance,
+                },
             );
         }
     }
@@ -6128,20 +6200,34 @@ fn usage_bar_fill_percentage(percent: f64, text: &str) -> f64 {
     }
 }
 
-fn draw_usage_bar(
-    hdc: HDC,
+struct UsageBar<'a> {
     bar_x: i32,
     y: i32,
     segment_count: i32,
     percent: f64,
-    text: &str,
-    accent: &Color,
-    track: &Color,
-    text_color: &Color,
+    text: &'a str,
+    accent: &'a Color,
+    track: &'a Color,
+    text_color: &'a Color,
     text_width: i32,
     is_dark: bool,
     appearance: Appearance,
-) {
+}
+
+fn draw_usage_bar(hdc: HDC, bar: UsageBar<'_>) {
+    let UsageBar {
+        bar_x,
+        y,
+        segment_count,
+        percent,
+        text,
+        accent,
+        track,
+        text_color,
+        text_width,
+        is_dark,
+        appearance,
+    } = bar;
     let seg_w = sc(SEGMENT_W);
     let seg_h = appearance.bar_height();
     let seg_gap = sc(SEGMENT_GAP);
@@ -6177,14 +6263,16 @@ fn draw_usage_bar(
     let text_x = bar_x + bar_width + sc(BAR_RIGHT_MARGIN);
     quota_text::draw(
         hdc,
-        text_x,
-        y,
-        appearance.row_height(),
-        text_width,
-        text,
-        text_color,
-        &reset_text_color(appearance, is_dark),
-        appearance.font_px(),
+        quota_text::QuotaText {
+            x: text_x,
+            y,
+            height: appearance.row_height(),
+            width: text_width,
+            value: text,
+            primary: text_color,
+            secondary: &reset_text_color(appearance, is_dark),
+            font_px: appearance.font_px(),
+        },
         sc,
     );
 }

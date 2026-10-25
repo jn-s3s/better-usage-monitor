@@ -872,24 +872,21 @@ fn wsl_credential_watch_signature(distro: &str) -> Option<String> {
 
 fn fetch_usage_with_fallback(token: &str) -> Result<UsageData, PollError> {
     // Try the dedicated usage endpoint first
-    match try_usage_endpoint(token)? {
-        Some(data) => {
-            // If reset timers are missing, fill them in from the Messages API
-            if data.session.resets_at.is_none() || data.weekly.resets_at.is_none() {
-                if let Ok(fallback) = fetch_usage_via_messages(token) {
-                    let mut merged = data;
-                    if merged.session.resets_at.is_none() {
-                        merged.session.resets_at = fallback.session.resets_at;
-                    }
-                    if merged.weekly.resets_at.is_none() {
-                        merged.weekly.resets_at = fallback.weekly.resets_at;
-                    }
-                    return Ok(merged);
+    if let Some(data) = try_usage_endpoint(token)? {
+        // If reset timers are missing, fill them in from the Messages API
+        if data.session.resets_at.is_none() || data.weekly.resets_at.is_none() {
+            if let Ok(fallback) = fetch_usage_via_messages(token) {
+                let mut merged = data;
+                if merged.session.resets_at.is_none() {
+                    merged.session.resets_at = fallback.session.resets_at;
                 }
+                if merged.weekly.resets_at.is_none() {
+                    merged.weekly.resets_at = fallback.weekly.resets_at;
+                }
+                return Ok(merged);
             }
-            return Ok(data);
         }
-        None => {}
+        return Ok(data);
     }
 
     // Fall back to Messages API with rate limit headers
@@ -1788,7 +1785,7 @@ fn decode_wsl_text(bytes: &[u8]) -> String {
 }
 
 fn decode_utf16le(bytes: &[u8]) -> Option<String> {
-    if bytes.len() < 2 || bytes.len() % 2 != 0 {
+    if bytes.len() < 2 || !bytes.len().is_multiple_of(2) {
         return None;
     }
 
@@ -1801,8 +1798,10 @@ fn decode_utf16le(bytes: &[u8]) -> Option<String> {
     };
 
     let units: Vec<u16> = body
-        .chunks_exact(2)
-        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| u16::from_le_bytes(*chunk))
         .collect();
 
     Some(String::from_utf16_lossy(&units))
@@ -1816,7 +1815,9 @@ fn looks_like_utf16le(bytes: &[u8]) -> bool {
     }
 
     let nul_high_bytes = bytes[..sample_len]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .filter(|chunk| chunk[1] == 0)
         .count();
 
@@ -1893,7 +1894,7 @@ fn parse_datetime_to_unix(s: &str, _fmt: &str) -> Result<u64, ()> {
 }
 
 fn is_leap(y: u64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+    (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
 }
 
 /// Codex leaves absent windows as default sections. Its reported windows
@@ -2021,6 +2022,44 @@ fn time_until_display_change_from_secs(total_secs: u64) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wsl_text_decoding_preserves_utf16_and_utf8_output() {
+        let text = "Ubuntu\r\n";
+        let encoded: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert_eq!(decode_wsl_text(&encoded), text);
+
+        let unicode = "Ubuntu 日本語 😀\r\n";
+        let with_bom: Vec<u8> = std::iter::once(0xFEFF)
+            .chain(unicode.encode_utf16())
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(decode_wsl_text(&with_bom), unicode);
+        assert_eq!(decode_wsl_text(unicode.as_bytes()), unicode);
+        assert_eq!(decode_wsl_text(&[]), "");
+    }
+
+    #[test]
+    fn utf16_detection_handles_short_odd_and_invalid_input() {
+        for bytes in [&[][..], &[0], &[b'A', 0, b'B']] {
+            assert_eq!(decode_utf16le(bytes), None);
+        }
+        assert!(!looks_like_utf16le(&[]));
+        // Detection ignores an incomplete trailing unit, as before.
+        assert!(looks_like_utf16le(&[b'A', 0, b'B']));
+        assert_eq!(decode_utf16le(&[0xFF, 0xFE]), Some(String::new()));
+        assert_eq!(
+            decode_utf16le(&[0xFF, 0xFE, 0x00, 0xD8]),
+            Some("\u{FFFD}".into())
+        );
+    }
+
+    #[test]
+    fn leap_years_follow_gregorian_century_rules() {
+        for (year, expected) in [(1900, false), (2000, true), (2024, true), (2025, false)] {
+            assert_eq!(is_leap(year), expected, "year {year}");
+        }
+    }
 
     #[test]
     fn missing_codex_cli_is_a_resolution_error_not_a_fake_script_path() {
