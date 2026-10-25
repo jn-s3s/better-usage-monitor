@@ -120,9 +120,14 @@ Claude 桌面客户端与 Claude Code CLI 使用相互独立的本地登录状�
 组件一次只显示一个 Codex 账号。右键单击组件或托盘图标，打开 **Codex 账号**菜单即可管理其他账号：
 
 - **添加账号…** 会为新的配置目录（`~/.codex-account2`、`~/.codex-account3`……）启动 `codex login`，然后等待凭据文件出现。Codex CLI 会打开自己的控制台和浏览器，在那里完成登录后，该账号会自动添加并被选中。如果 5 分钟内没有完成登录，则不会添加任何账号。最多可监控 39 个 Codex 登录（含默认登录），达到上限后该菜单项会提示已达上限而不再启动登录；`codex_accounts` 中多出的条目会被忽略。
-- 登录进行期间，该菜单项会变成**取消登录**。选择它会停止等待凭据，适合 Codex 窗口已经报错的情况。控制台窗口通常会保持打开，方便查看其中的信息；看完后自行关闭即可。
+- 登录进行期间，该菜单项会变成**停止等待登录**。它只停止本工具的等待，不会关闭 CLI 或浏览器；不再使用的 Codex 窗口请自行关闭。
 - 选择任意一个已列出的登录，组件就会切换到它。该选择会被保存，重启后仍然有效。
-- **移除账号：…** 只对组件当前显示的登录出现，默认登录不会有这一项。移除只是停止监控，配置目录和其中的凭据都会保留。
+- **移除账号：…** 只对组件当前显示的登录出现，默认登录不会有这一项。对于用户主目录下由应用管理的编号配置，确认后会永久删除目录和凭据，之后需要重新登录。自定义目录、链接或目录联接、与其他已配置登录共享的目录只会取消监控，不会删除。若删除失败，账号仍会保留在监控列表中；请关闭使用该配置的 Codex 窗口后重试。
+- **使用已保存的配置** 会列出已完成登录但尚未监控的配置，包括旧版本留下的配置，或在取消登录、等待超时后才完成的登录。已删除的配置无法恢复，需要通过**添加账号…**重新登录。另一次登录尚在等待或账号数量已达上限时，此菜单不可用。
+
+如果登录的账号已被监控，应用会切换到现有条目，而不会重复添加，并在可能时删除这次重复登录的暂存配置。匹配依据是凭据中的账号 ID 和可用的用户标识，不是显示邮箱。配置中的重复账号和解析到同一目录的路径也会被过滤。每次新登录都会使用新暂存目录，避免旧的 CLI 窗口覆盖重试的凭据；不再使用的 CLI 窗口请自行关闭。
+
+登录尝试会先使用 `~/.codex-login-attempts` 下的独立目录，而不是编号账号目录。只有已完成且不重复的登录才会移到下一个可用的 `~/.codex-account<N>` 目录。未完成的尝试会保留在暂存区，因为 CLI 窗口仍可能完成登录；**使用已保存的配置**也会发现已完成的暂存登录。已有目录不会被覆盖，移除后空出的编号可供新的成功登录使用。重复登录不会替换现有配置的凭据。额外账号需要重新登录时，可移除后重新添加；默认登录请在 Codex CLI 中运行 `codex login` 后刷新本工具。Codex 隐藏时，添加账号只会选中它，不会自动启用 Codex；请在**监控服务**中启用以显示。
 
 多账号显示方式：
 
@@ -138,11 +143,22 @@ Claude 桌面客户端与 Claude Code CLI 使用相互独立的本地登录状�
 
     ```powershell
     New-Item -ItemType Directory -Force "$env:USERPROFILE\.codex-work" | Out-Null
-    $env:CODEX_HOME = "$env:USERPROFILE\.codex-work"
-    codex login
+    & {
+        $previousHome = $env:CODEX_HOME
+        try {
+            $env:CODEX_HOME = "$env:USERPROFILE\.codex-work"
+            codex login
+        } finally {
+            if ($null -eq $previousHome) {
+                Remove-Item Env:CODEX_HOME -ErrorAction SilentlyContinue
+            } else {
+                $env:CODEX_HOME = $previousHome
+            }
+        }
+    }
     ```
 
-    目录必须事先存在：否则 `codex login` 会以 `CODEX_HOME points to … but that path does not exist` 直接退出。运行 `codex login` 时要保持 `CODEX_HOME` 已设置。否则 `codex login` 登录的是默认账号。
+    目录必须事先存在：否则 `codex login` 会以 `CODEX_HOME points to … but that path does not exist` 直接退出。脚本只在此次登录期间设置 `CODEX_HOME`，失败后也会恢复原值，避免随后从同一终端启动本工具时改变默认账号。
 
 2. 写入该 profile：
 

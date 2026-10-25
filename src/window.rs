@@ -108,8 +108,9 @@ impl CodexLogin {
 struct CodexAccountView {
     label: String,
     active: bool,
-    /// Whether the latest poll succeeded, so hover text can explain failures.
+    /// Whether cached usage is available.
     has_data: bool,
+    has_error: bool,
     /// Rendered 5-hour and weekly text, or the short error label.
     session_text: String,
     weekly_text: String,
@@ -146,7 +147,7 @@ fn codex_other_account_lines(state: &AppState, include_detail: bool) -> Vec<Stri
         .map(|view| {
             let mut line =
                 codex_account_line(view, state.show_session_window, state.show_weekly_window);
-            if include_detail && !view.has_data {
+            if include_detail && (!view.has_data || view.has_error) {
                 line.push('\n');
                 line.push_str(&view.detail);
             }
@@ -168,6 +169,7 @@ fn folder_name(home: Option<&std::path::Path>) -> String {
 struct PendingCodexLogin {
     home: PathBuf,
     started: Instant,
+    publication_failure_reported: bool,
 }
 
 /// How long a started `codex login` is watched before the monitor stops waiting.
@@ -176,53 +178,67 @@ const CODEX_LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 /// What the watcher found while waiting for a started sign-in.
 enum CodexLoginOutcome {
     Waiting,
+    PublicationFailed(String),
     Added(String),
-    TimedOut(PathBuf),
+    Duplicate(String),
+    TimedOut,
 }
 
 /// What happened when the menu asked to start or stop a sign-in.
 enum CodexLoginStart {
-    Started(PathBuf),
-    Cancelled(PathBuf),
-    Failed(PathBuf),
+    Started,
+    Cancelled,
+    Failed {
+        home: Option<PathBuf>,
+        error: String,
+        missing_cli: bool,
+    },
     /// The login cap is reached, so no new sign-in was started.
     Limit,
 }
 
 /// Tray balloon events for the add/remove account flow.
 enum CodexLoginNotice<'a> {
-    Started { folder: &'a str },
-    Added { label: &'a str },
-    Cancelled { folder: &'a str },
-    TimedOut { path: &'a str },
-    Failed { path: &'a str },
-    Removed { label: &'a str },
+    Started,
+    Added { label: &'a str, hidden: bool },
+    Duplicate { label: &'a str },
+    Cancelled,
+    TimedOut,
+    Failed,
+    Removed { label: &'a str, deleted: bool },
     Limit,
 }
 
 fn codex_login_notice(language: LanguageId, notice: CodexLoginNotice) -> (String, String) {
     let strings = language.strings().codex_accounts;
     let (title, body) = match notice {
-        CodexLoginNotice::Started { folder } => {
-            (strings.title, strings.started.replace("{folder}", folder))
+        CodexLoginNotice::Started => (strings.title, strings.started.to_string()),
+        CodexLoginNotice::Cancelled => (strings.title, strings.cancelled.to_string()),
+        CodexLoginNotice::Added { label, hidden } => {
+            let mut body = strings.added.replace("{label}", label);
+            if hidden {
+                body.push(' ');
+                body.push_str(
+                    &strings
+                        .hidden
+                        .replace("{models}", language.strings().models),
+                );
+            }
+            (strings.added_title, body)
         }
-        CodexLoginNotice::Cancelled { folder } => {
-            (strings.title, strings.cancelled.replace("{folder}", folder))
+        CodexLoginNotice::Duplicate { label } => {
+            (strings.title, strings.duplicate.replace("{label}", label))
         }
-        CodexLoginNotice::Added { label } => {
-            (strings.added_title, strings.added.replace("{label}", label))
-        }
-        CodexLoginNotice::TimedOut { path } => (
-            strings.timed_out_title,
-            strings.timed_out.replace("{path}", path),
-        ),
-        CodexLoginNotice::Failed { path } => (
-            strings.failed_title,
-            strings.failed.replace("{path}", &powershell_path(path)),
-        ),
-        CodexLoginNotice::Removed { label } => (
+        CodexLoginNotice::TimedOut => (strings.timed_out_title, strings.timed_out.to_string()),
+        CodexLoginNotice::Failed => (strings.failed_title, strings.failed.to_string()),
+        CodexLoginNotice::Removed { label, deleted } => (
             strings.removed_title,
-            strings.removed.replace("{label}", label),
+            (if deleted {
+                strings.removed_deleted
+            } else {
+                strings.removed
+            })
+            .replace("{label}", label),
         ),
         CodexLoginNotice::Limit => (
             strings.limit_title,
@@ -234,22 +250,151 @@ fn codex_login_notice(language: LanguageId, notice: CodexLoginNotice) -> (String
     (title.to_string(), body)
 }
 
-/// Escape a path embedded in a PowerShell single-quoted string.
-fn powershell_path(path: &str) -> String {
-    path.replace('\'', "''")
-        .replace('‘', "‘‘")
-        .replace('’', "’’")
-        .replace('‚', "‚‚")
-        .replace('‛', "‛‛")
+fn codex_start_failure_details(
+    language: LanguageId,
+    home: Option<&Path>,
+    error: &str,
+    missing_cli: bool,
+) -> String {
+    let strings = language.strings().codex_accounts;
+    if missing_cli {
+        format!("{}\n\n{error}", strings.missing_cli)
+    } else if home.is_some() {
+        format!("{}\n\n{error}", strings.failed)
+    } else {
+        format!("{}\n\n{error}", strings.profile_failed)
+    }
+}
+
+fn codex_recovery_hint(language: LanguageId, error: Option<poller::PollError>) -> Option<String> {
+    let strings = language.strings().codex_accounts;
+    match error {
+        Some(poller::PollError::AccountMismatch) => Some(strings.mismatch.to_string()),
+        Some(
+            poller::PollError::AuthRequired
+            | poller::PollError::NoCredentials
+            | poller::PollError::TokenExpired,
+        ) => Some(strings.reauthenticate.to_string()),
+        _ => None,
+    }
 }
 
 /// First `.codex-account<N>` directory that is free. `taken` stands in for the
 /// filesystem so the naming rule can be tested without creating directories.
-fn next_profile_home(base: &Path, taken: impl Fn(&Path) -> bool) -> PathBuf {
+fn next_profile_home(base: &Path, taken: impl Fn(&Path) -> bool) -> Option<PathBuf> {
     (2..1000)
         .map(|index| base.join(format!(".codex-account{index}")))
         .find(|candidate| !taken(candidate))
-        .unwrap_or_else(|| base.join(".codex-account"))
+}
+
+/// Keep unfinished attempts out of the numbered account folders. Each CLI gets
+/// its own staging home because cancelled attempts can still finish later.
+fn reserve_login_home(base: &Path) -> std::io::Result<PathBuf> {
+    let staging = base.join(".codex-login-attempts");
+    std::fs::create_dir_all(&staging)?;
+    let stamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for index in 0..1000 {
+        let home = staging.join(format!("{}-{stamp}-{index}", std::process::id()));
+        match std::fs::create_dir(&home) {
+            Ok(()) => return Ok(home),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no free Codex login staging folder",
+    ))
+}
+
+/// Publish only authenticated attempts. A rename preserves the entire CLI
+/// profile; a sharing violation leaves it staged for a later retry.
+fn publish_profile_home(
+    base: &Path,
+    staged: &Path,
+    logins: &[CodexLogin],
+) -> std::io::Result<PathBuf> {
+    if !poller::codex_profile_ready(staged) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Codex sign-in is not complete",
+        ));
+    }
+    loop {
+        let home = next_profile_home(base, |candidate| {
+            candidate.symlink_metadata().is_ok()
+                || matching_codex_login(logins, candidate).is_some()
+        })
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "no free Codex profile folder",
+            )
+        })?;
+        match std::fs::rename(staged, &home) {
+            Ok(()) => return Ok(home),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn matching_codex_login(logins: &[CodexLogin], home: &Path) -> Option<usize> {
+    let account = poller::CodexAccount::profile(String::new(), home.to_path_buf());
+    let identity = poller::codex_account_identity(&account);
+    let path = path_identity(home);
+    logins.iter().position(|login| {
+        let existing = login.account();
+        poller::codex_auth_path_for(&existing)
+            .and_then(|auth| auth.parent().map(path_identity))
+            .is_some_and(|existing| existing == path)
+            || identity.as_ref().is_some_and(|identity| {
+                identity.1.is_some() && {
+                    poller::codex_account_identity(&existing).as_ref() == Some(identity)
+                }
+            })
+    })
+}
+
+/// Saved CLI profiles created by this app, including removed and late logins.
+/// Discovery never launches a CLI or changes the credentials.
+fn saved_codex_profiles(
+    base: &Path,
+    logins: &[CodexLogin],
+    pending: Option<&Path>,
+) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return Vec::new();
+    };
+    let staged = std::fs::read_dir(base.join(".codex-login-attempts"));
+    let staged = staged
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path());
+    let mut homes: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|home| {
+            let name = folder_name(Some(home));
+            let managed = name.strip_prefix(".codex-account").is_some_and(|suffix| {
+                suffix.is_empty() || suffix.parse::<u32>().is_ok_and(|index| index >= 2)
+            });
+            managed
+        })
+        .chain(staged)
+        .filter(|home| {
+            pending.is_none_or(|pending| path_identity(pending) != path_identity(home))
+                && poller::codex_profile_ready(home)
+                && matching_codex_login(logins, home).is_none()
+        })
+        .collect();
+    homes.sort();
+    homes.truncate(MAX_CODEX_ACCOUNT_MENU_ITEMS);
+    homes
 }
 
 /// Base directory for profile folders the menu creates: the home directory, or
@@ -264,9 +409,53 @@ fn menu_text(label: &str) -> String {
     label.replace('&', "&&")
 }
 
-/// Register a profile after its sign-in finished, display it, and return its
-/// label. The directory itself is owned by the Codex CLI.
-fn register_codex_login(state: &mut AppState, home: &Path) -> String {
+/// Register a completed sign-in, or select its existing account. The directory
+/// itself is owned by the Codex CLI and is never deleted on a duplicate.
+fn register_codex_login(state: &mut AppState, home: &Path) -> CodexLoginOutcome {
+    if let Some(index) = matching_codex_login(&state.codex_logins, home) {
+        state.active_codex_account = index;
+        sync_monitor(state);
+        // A successful duplicate attempt is disposable, unlike an existing
+        // saved profile. Do not leave another recoverable copy of this login.
+        if home.parent().is_some_and(|parent| {
+            path_identity(parent)
+                == path_identity(&profile_base_dir().join(".codex-login-attempts"))
+        }) && !state
+            .codex_logins
+            .iter()
+            .filter_map(|login| {
+                poller::codex_auth_path_for(&login.account())
+                    .and_then(|auth| auth.parent().map(Path::to_path_buf))
+            })
+            .chain(poller::codex_home())
+            .any(|protected| profile_homes_overlap(home, &protected))
+        {
+            if let Err(error) = delete_managed_profile(home) {
+                diagnose::log_error("unable to remove duplicate login attempt", error);
+            }
+        }
+        return CodexLoginOutcome::Duplicate(state.codex_logins[index].display_label.clone());
+    }
+    let published;
+    let home = if let Some(staging) = home.parent().filter(|parent| {
+        parent
+            .file_name()
+            .is_some_and(|name| name == ".codex-login-attempts")
+    }) {
+        let Some(base) = staging.parent() else {
+            return CodexLoginOutcome::Waiting;
+        };
+        published = match publish_profile_home(base, home, &state.codex_logins) {
+            Ok(home) => home,
+            Err(error) => {
+                diagnose::log_error("unable to publish Codex profile", &error);
+                return CodexLoginOutcome::PublicationFailed(error.to_string());
+            }
+        };
+        published.as_path()
+    } else {
+        home
+    };
     let mut login = CodexLogin::profile(String::new(), home.to_path_buf());
     login.display_label = truncate_label(&login.display_label);
     let label = login.display_label.clone();
@@ -275,12 +464,22 @@ fn register_codex_login(state: &mut AppState, home: &Path) -> String {
     refresh_default_codex_login_label(state);
     // Slot 1 changes identity; remap slots while preserving other targets.
     sync_monitor(state);
-    label
+    CodexLoginOutcome::Added(label)
 }
 
 fn notify_codex_account(hwnd: HWND, notice: CodexLoginNotice, language: LanguageId) {
+    let severity = codex_notice_severity(&notice);
     let (title, body) = codex_login_notice(language, notice);
-    tray_icon::notify_balloon(hwnd, tray_icon::TrayIconKind::Codex, &title, &body);
+    tray_icon::notify_balloon_with_severity(hwnd, &title, &body, severity);
+}
+
+fn codex_notice_severity(notice: &CodexLoginNotice) -> tray_icon::NoticeSeverity {
+    match notice {
+        CodexLoginNotice::TimedOut | CodexLoginNotice::Failed | CodexLoginNotice::Limit => {
+            tray_icon::NoticeSeverity::Warning
+        }
+        _ => tray_icon::NoticeSeverity::Information,
+    }
 }
 
 /// Shared application state
@@ -325,6 +524,8 @@ struct AppState {
     /// A `codex login` started from the menu that is still waiting for its
     /// credentials file.
     pending_codex_login: Option<PendingCodexLogin>,
+    /// Snapshot of the saved-profile menu; command IDs refer to this exact list.
+    saved_codex_profile_menu: Vec<PathBuf>,
 
     data: Option<AppUsageData>,
 
@@ -414,6 +615,7 @@ const MAX_CODEX_ACCOUNT_MENU_ITEMS: usize = 39;
 /// Start `codex login` for a new profile, and unregister the checked profile.
 const IDM_CODEX_ACCOUNT_ADD: u16 = 149;
 const IDM_CODEX_ACCOUNT_REMOVE: u16 = 150;
+const IDM_CODEX_RESTORE_FIRST: u16 = 151;
 const IDM_MONITOR_FIRST: u16 = 200;
 const MAX_MONITOR_MENU_ITEMS: usize = 100;
 
@@ -855,13 +1057,32 @@ fn normalize_settings(mut settings: SettingsFile) -> SettingsFile {
         .checked_sub(1)
         .and_then(|index| settings.codex_accounts.get(index))
         .map(|account| path_identity(Path::new(account.codex_home.trim())));
+    let active_identity = settings
+        .active_codex_account
+        .checked_sub(1)
+        .and_then(|index| settings.codex_accounts.get(index))
+        .and_then(|account| {
+            poller::codex_account_identity(&poller::CodexAccount::profile(
+                String::new(),
+                PathBuf::from(account.codex_home.trim()),
+            ))
+        });
     settings.codex_accounts = normalize_codex_accounts(settings.codex_accounts);
     settings.active_codex_account = active_home
         .and_then(|home| {
-            settings
-                .codex_accounts
-                .iter()
-                .position(|account| path_identity(Path::new(&account.codex_home)) == home)
+            settings.codex_accounts.iter().position(|account| {
+                path_identity(Path::new(&account.codex_home)) == home
+                    || active_identity.as_ref().is_some_and(|identity| {
+                        identity.1.is_some() && {
+                            poller::codex_account_identity(&poller::CodexAccount::profile(
+                                String::new(),
+                                PathBuf::from(&account.codex_home),
+                            ))
+                            .as_ref()
+                                == Some(identity)
+                        }
+                    })
+            })
         })
         .map_or(0, |index| index + 1);
     settings
@@ -875,6 +1096,12 @@ fn normalize_codex_accounts(accounts: Vec<CodexAccountSetting>) -> Vec<CodexAcco
     // A profile pointing at the default Codex home would poll the same login twice
     // under two names, so it is dropped like any other duplicate.
     let default_home = poller::codex_home().as_deref().map(path_identity);
+    let default_identity =
+        poller::codex_account_identity(&poller::CodexAccount::default_account(String::new()));
+    let mut identities = Vec::new();
+    if let Some(identity) = default_identity.filter(|identity| identity.1.is_some()) {
+        identities.push(identity);
+    }
     let mut seen: Vec<String> = Vec::new();
     let mut normalized: Vec<CodexAccountSetting> = Vec::new();
     for mut account in accounts {
@@ -889,6 +1116,16 @@ fn normalize_codex_accounts(accounts: Vec<CodexAccountSetting>) -> Vec<CodexAcco
         let identity = path_identity(path);
         if seen.contains(&identity) || default_home.as_ref() == Some(&identity) {
             continue;
+        }
+        let account_identity = poller::codex_account_identity(&poller::CodexAccount::profile(
+            String::new(),
+            path.to_path_buf(),
+        ));
+        if let Some(account_identity) = account_identity.filter(|identity| identity.1.is_some()) {
+            if identities.contains(&account_identity) {
+                continue;
+            }
+            identities.push(account_identity);
         }
         seen.push(identity);
         account.codex_home = home;
@@ -906,7 +1143,27 @@ fn normalize_codex_accounts(accounts: Vec<CodexAccountSetting>) -> Vec<CodexAcco
 /// variants of the same directory (mixed slashes, a trailing separator) compare
 /// equal and do not become two slots for one login.
 fn path_identity(path: &Path) -> String {
-    path.components()
+    // Existing paths resolve junctions and symlinks. Lexically normalize missing
+    // paths too, so `profiles\unused\..\work` cannot become another slot.
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let text = resolved.to_string_lossy();
+    let text = if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else {
+        text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
+    };
+    let mut normalized = PathBuf::new();
+    for component in Path::new(&text).components() {
+        match component {
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::CurDir => {}
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+        .components()
         .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
         .collect::<Vec<_>>()
         .join("\\")
@@ -1001,17 +1258,8 @@ fn codex_auth_notice_title(strings: Strings, account: &poller::CodexAccount) -> 
     }
 }
 
-fn codex_auth_notice_body(strings: Strings, account: &poller::CodexAccount) -> String {
-    if account.is_default() {
-        strings.codex_token_expired_body.to_string()
-    } else if let Some(home) = account.home.as_deref() {
-        strings
-            .codex_accounts
-            .reauthenticate
-            .replace("{path}", &powershell_path(&home.display().to_string()))
-    } else {
-        strings.codex_token_expired_body.to_string()
-    }
+fn codex_auth_notice_body(strings: Strings, _account: &poller::CodexAccount) -> String {
+    strings.codex_accounts.reauthenticate.to_string()
 }
 
 fn save_settings(settings: &SettingsFile) {
@@ -1778,9 +2026,17 @@ fn codex_account_views(state: &AppState) -> Vec<CodexAccountView> {
                 label: account.label.clone(),
                 active: service_id == 1,
                 has_data,
+                has_error: service.error.is_some(),
                 session_text,
                 weekly_text,
-                detail: service.description(now, clock, show_remaining),
+                detail: {
+                    let mut detail = service.description(now, clock, show_remaining);
+                    if let Some(hint) = codex_recovery_hint(state.language, service.error) {
+                        detail.push('\n');
+                        detail.push_str(&hint);
+                    }
+                    detail
+                },
             })
         })
         .collect()
@@ -2647,6 +2903,7 @@ pub fn run() {
                 codex_logins,
                 codex_account_views: Vec::new(),
                 pending_codex_login: None,
+                saved_codex_profile_menu: Vec::new(),
                 data: None,
                 poll_interval_ms: settings.poll_interval_ms,
                 adaptive_refresh: settings.adaptive_refresh,
@@ -2815,6 +3072,12 @@ fn update_quota_tooltips() {
                     });
                 }
                 if id == 1 {
+                    if let Some(hint) =
+                        codex_recovery_hint(s.language, s.monitor.services[id].error)
+                    {
+                        text.push('\n');
+                        text.push_str(&hint);
+                    }
                     if s.monitor.services[id].data.is_some() {
                         for (missing, is_weekly) in
                             [(session == "--", false), (weekly == "--", true)]
@@ -3303,35 +3566,50 @@ fn toggle_codex_account_login(hwnd: HWND) {
             Some(s) => match s.pending_codex_login.take() {
                 // Asking again while a sign-in runs stops waiting for it, so an
                 // attempt that goes nowhere leaves a way forward in the menu.
-                Some(pending) => (s.language, CodexLoginStart::Cancelled(pending.home)),
+                Some(_) => (s.language, CodexLoginStart::Cancelled),
                 None => {
                     if s.codex_logins.len() >= MAX_CODEX_ACCOUNT_MENU_ITEMS {
                         // The menu lists every login, so one past the cap would
                         // poll with no menu entry to select or remove it.
                         (s.language, CodexLoginStart::Limit)
                     } else {
-                        // An empty folder left behind by an attempt that never
-                        // finished is reused; a folder that already holds a login
-                        // or is monitored is left alone.
-                        let home = next_profile_home(&profile_base_dir(), |candidate| {
-                            poller::codex_profile_ready(candidate)
-                                || s.codex_logins
-                                    .iter()
-                                    .any(|login| login.home.as_deref() == Some(candidate))
-                        });
-                        match poller::spawn_codex_login(&home) {
-                            Ok(()) => {
-                                s.pending_codex_login = Some(PendingCodexLogin {
-                                    home: home.clone(),
-                                    started: Instant::now(),
-                                });
-                                (s.language, CodexLoginStart::Started(home))
-                            }
+                        let base = profile_base_dir();
+                        let outcome = match reserve_login_home(&base) {
+                            Ok(home) => match poller::spawn_codex_login(&home) {
+                                Ok(()) => {
+                                    s.pending_codex_login = Some(PendingCodexLogin {
+                                        home,
+                                        started: Instant::now(),
+                                        publication_failure_reported: false,
+                                    });
+                                    CodexLoginStart::Started
+                                }
+                                Err(error) => {
+                                    if let Err(cleanup) = std::fs::remove_dir(&home) {
+                                        diagnose::log_error(
+                                            "unable to remove unused login staging folder",
+                                            cleanup,
+                                        );
+                                    }
+                                    let missing_cli = error.kind() == std::io::ErrorKind::NotFound;
+                                    diagnose::log_error("unable to start Codex login", &error);
+                                    CodexLoginStart::Failed {
+                                        home: Some(home),
+                                        error: error.to_string(),
+                                        missing_cli,
+                                    }
+                                }
+                            },
                             Err(error) => {
-                                diagnose::log_error("unable to start Codex login", error);
-                                (s.language, CodexLoginStart::Failed(home))
+                                diagnose::log_error("unable to reserve Codex profile", &error);
+                                CodexLoginStart::Failed {
+                                    home: None,
+                                    error: error.to_string(),
+                                    missing_cli: false,
+                                }
                             }
-                        }
+                        };
+                        (s.language, outcome)
                     }
                 }
             },
@@ -3340,33 +3618,28 @@ fn toggle_codex_account_login(hwnd: HWND) {
     };
 
     match outcome {
-        CodexLoginStart::Started(home) => {
+        CodexLoginStart::Started => {
             // One second is enough to notice the credentials file without
             // polling the filesystem hard while the user finishes sign-in.
             unsafe {
                 SetTimer(hwnd, TIMER_CODEX_LOGIN, 1_000, None);
             }
-            let folder = folder_name(Some(&home));
-            notify_codex_account(
-                hwnd,
-                CodexLoginNotice::Started { folder: &folder },
-                language,
-            );
+            notify_codex_account(hwnd, CodexLoginNotice::Started, language);
         }
-        CodexLoginStart::Cancelled(home) => {
+        CodexLoginStart::Cancelled => {
             unsafe {
                 let _ = KillTimer(hwnd, TIMER_CODEX_LOGIN);
             }
-            let folder = folder_name(Some(&home));
-            notify_codex_account(
-                hwnd,
-                CodexLoginNotice::Cancelled { folder: &folder },
-                language,
-            );
+            notify_codex_account(hwnd, CodexLoginNotice::Cancelled, language);
         }
-        CodexLoginStart::Failed(home) => {
-            let path = home.display().to_string();
-            notify_codex_account(hwnd, CodexLoginNotice::Failed { path: &path }, language);
+        CodexLoginStart::Failed {
+            home,
+            error,
+            missing_cli,
+        } => {
+            notify_codex_account(hwnd, CodexLoginNotice::Failed, language);
+            let text = codex_start_failure_details(language, home.as_deref(), &error, missing_cli);
+            show_error_message(hwnd, language.strings().codex_accounts.failed_title, &text);
         }
         CodexLoginStart::Limit => {
             notify_codex_account(hwnd, CodexLoginNotice::Limit, language);
@@ -3374,34 +3647,212 @@ fn toggle_codex_account_login(hwnd: HWND) {
     }
 }
 
-/// Stop monitoring the login the widget displays. The profile folder belongs to
-/// the user and to the Codex CLI, so it is never deleted here.
+/// Only numbered, direct children of the app's profile base are disposable.
+/// Treat links, custom homes and any overlap with a protected login as external.
+fn managed_profile_for_removal(
+    base: &Path,
+    home: &Path,
+    protected: &[PathBuf],
+) -> std::io::Result<Option<PathBuf>> {
+    use std::os::windows::fs::MetadataExt;
+
+    let name = folder_name(Some(home));
+    let numbered = name.strip_prefix(".codex-account").is_some_and(|suffix| {
+        suffix
+            .parse::<u32>()
+            .is_ok_and(|index| (2..1000).contains(&index) && suffix == index.to_string())
+    });
+    if !numbered
+        || home
+            .parent()
+            .is_none_or(|parent| path_identity(parent) != path_identity(base))
+    {
+        return Ok(None);
+    }
+    match std::fs::symlink_metadata(home) {
+        // Reject all reparse points, including junctions (not just symlinks).
+        Ok(metadata)
+            if !metadata.is_dir()
+                || metadata.file_attributes()
+                    & windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT.0
+                    != 0 =>
+        {
+            return Ok(None);
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    if protected
+        .iter()
+        .any(|path| profile_homes_overlap(home, path))
+    {
+        return Ok(None);
+    }
+    Ok(Some(home.to_path_buf()))
+}
+
+fn profile_homes_overlap(home: &Path, other: &Path) -> bool {
+    let home = PathBuf::from(path_identity(home));
+    let other = PathBuf::from(path_identity(other));
+    other.starts_with(&home) || home.starts_with(&other)
+}
+
+/// Missing folders are already removed; other failures must keep the login in
+/// settings so the user can retry instead of silently orphaning credentials.
+fn delete_managed_profile(home: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(home) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn protected_codex_homes(state: &AppState, index: usize) -> Vec<PathBuf> {
+    let mut protected: Vec<_> = state
+        .codex_logins
+        .iter()
+        .enumerate()
+        .filter(|(other, _)| *other != index)
+        .filter_map(|(_, login)| {
+            poller::codex_auth_path_for(&login.account())
+                .and_then(|auth| auth.parent().map(Path::to_path_buf))
+        })
+        .collect();
+    // Protect the default home even if a future caller omits the default entry.
+    protected.extend(poller::codex_home());
+    protected.extend(
+        state
+            .pending_codex_login
+            .as_ref()
+            .map(|pending| pending.home.clone()),
+    );
+    protected
+}
+
+/// Remove app-managed credentials only after confirmation. Custom profiles are
+/// detached without deleting anything; the main login cannot be removed.
 fn remove_active_codex_login(hwnd: HWND) {
-    let removed = {
-        let mut state = lock_state();
-        let Some(s) = state.as_mut() else { return };
-        if s.active_codex_account == 0 || s.active_codex_account >= s.codex_logins.len() {
-            None
-        } else {
-            let login = s.codex_logins.remove(s.active_codex_account);
-            // The default login is always the fallback, and slot 1 changes
-            // identity, so the monitor drops the removed login's numbers.
-            s.active_codex_account = 0;
-            refresh_default_codex_login_label(s);
-            sync_monitor(s);
-            Some((s.language, login.display_label))
+    let (language, label, home, disposable) = {
+        let state = lock_state();
+        let Some(s) = state.as_ref() else { return };
+        let index = s.active_codex_account;
+        if index == 0 {
+            return;
+        }
+        let Some(login) = s.codex_logins.get(index) else {
+            return;
+        };
+        let Some(home) = login.home.clone() else {
+            return;
+        };
+        let disposable = managed_profile_for_removal(
+            &profile_base_dir(),
+            &home,
+            &protected_codex_homes(s, index),
+        );
+        (s.language, login.display_label.clone(), home, disposable)
+    };
+    let strings = language.strings().codex_accounts;
+    let report_error = |error: std::io::Error| {
+        diagnose::log_error("unable to remove Codex profile", &error);
+        show_error_message(
+            hwnd,
+            strings.title,
+            &strings.remove_failed.replace("{error}", &error.to_string()),
+        );
+    };
+    let disposable = match disposable {
+        Ok(home) => home,
+        Err(error) => {
+            report_error(error);
+            return;
         }
     };
-
-    let Some((language, label)) = removed else {
-        return;
+    if let Some(path) = &disposable {
+        let message = strings
+            .remove_confirm
+            .replace("{label}", &label)
+            .replace("{path}", &path.display().to_string());
+        let title = native_interop::wide_str(strings.title);
+        let message = native_interop::wide_str(&message);
+        // No application lock is held across the modal dialog's message loop.
+        let confirmed = unsafe {
+            MessageBoxW(
+                hwnd,
+                PCWSTR::from_raw(message.as_ptr()),
+                PCWSTR::from_raw(title.as_ptr()),
+                MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+            ) == IDYES
+        };
+        if !confirmed {
+            return;
+        }
+    }
+    let result = (|| -> std::io::Result<bool> {
+        let mut state = lock_state();
+        let Some(s) = state.as_mut() else {
+            return Ok(false);
+        };
+        let Some(index) = s
+            .codex_logins
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find_map(|(index, login)| (login.home.as_deref() == Some(&home)).then_some(index))
+        else {
+            return Ok(false);
+        };
+        if disposable.is_some() {
+            // A token refresh can write auth.json or recreate a home. Never
+            // delete underneath it, and do not block the UI waiting for it.
+            let _write = poller::CODEX_PROFILE_WRITES.try_lock().map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "Codex token refresh is in progress; try again shortly",
+                )
+            })?;
+            let checked = managed_profile_for_removal(
+                &profile_base_dir(),
+                &home,
+                &protected_codex_homes(s, index),
+            )?;
+            if checked != disposable {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "profile path changed while confirming removal",
+                ));
+            }
+            delete_managed_profile(&home)?;
+        }
+        s.codex_logins.remove(index);
+        s.active_codex_account = 0;
+        refresh_default_codex_login_label(s);
+        sync_monitor(s);
+        s.saved_codex_profile_menu.clear();
+        Ok(true)
+    })();
+    match result {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(error) => {
+            report_error(error);
+            return;
+        }
     };
     save_state_settings();
     position_at_taskbar();
     render_layered();
     sync_tray_icons(hwnd);
     request_poll(SendHwnd::from_hwnd(hwnd), true);
-    notify_codex_account(hwnd, CodexLoginNotice::Removed { label: &label }, language);
+    notify_codex_account(
+        hwnd,
+        CodexLoginNotice::Removed {
+            label: &label,
+            deleted: disposable.is_some(),
+        },
+        language,
+    );
 }
 
 /// Watch for the credentials file a started `codex login` writes. Waiting on the
@@ -3416,40 +3867,77 @@ fn check_pending_codex_login(hwnd: HWND) {
             None => return,
         };
         if poller::codex_profile_ready(&home) {
-            s.pending_codex_login = None;
-            let label = register_codex_login(s, &home);
-            (s.language, CodexLoginOutcome::Added(label))
+            let mut outcome = register_codex_login(s, &home);
+            if !matches!(
+                outcome,
+                CodexLoginOutcome::Waiting | CodexLoginOutcome::PublicationFailed(_)
+            ) {
+                s.pending_codex_login = None;
+            } else if elapsed >= CODEX_LOGIN_TIMEOUT {
+                s.pending_codex_login = None;
+                outcome = CodexLoginOutcome::TimedOut;
+            } else if matches!(outcome, CodexLoginOutcome::PublicationFailed(_)) {
+                let pending = s.pending_codex_login.as_mut().unwrap();
+                if pending.publication_failure_reported {
+                    outcome = CodexLoginOutcome::Waiting;
+                } else {
+                    pending.publication_failure_reported = true;
+                }
+            }
+            (s.language, outcome)
         } else if elapsed >= CODEX_LOGIN_TIMEOUT {
             s.pending_codex_login = None;
-            (s.language, CodexLoginOutcome::TimedOut(home))
+            (s.language, CodexLoginOutcome::TimedOut)
         } else {
             (s.language, CodexLoginOutcome::Waiting)
         }
     };
 
-    let label = match outcome {
+    finish_codex_login(hwnd, language, outcome);
+}
+
+fn finish_codex_login(hwnd: HWND, language: LanguageId, outcome: CodexLoginOutcome) {
+    let duplicate = matches!(&outcome, CodexLoginOutcome::Duplicate(_));
+    let (label, duplicate) = match outcome {
         CodexLoginOutcome::Waiting => return,
-        CodexLoginOutcome::Added(label) => {
+        CodexLoginOutcome::PublicationFailed(error) => {
+            let strings = language.strings().codex_accounts;
+            show_error_message(
+                hwnd,
+                strings.failed_title,
+                &format!("{}\n\n{error}", strings.profile_failed),
+            );
+            return;
+        }
+        CodexLoginOutcome::Added(label) | CodexLoginOutcome::Duplicate(label) => {
             save_state_settings();
             position_at_taskbar();
             render_layered();
             sync_tray_icons(hwnd);
             request_poll(SendHwnd::from_hwnd(hwnd), true);
-            label
+            (label, duplicate)
         }
-        CodexLoginOutcome::TimedOut(home) => {
-            let path = home.display().to_string();
+        CodexLoginOutcome::TimedOut => {
             unsafe {
                 let _ = KillTimer(hwnd, TIMER_CODEX_LOGIN);
             }
-            notify_codex_account(hwnd, CodexLoginNotice::TimedOut { path: &path }, language);
+            notify_codex_account(hwnd, CodexLoginNotice::TimedOut, language);
             return;
         }
     };
     unsafe {
         let _ = KillTimer(hwnd, TIMER_CODEX_LOGIN);
     }
-    notify_codex_account(hwnd, CodexLoginNotice::Added { label: &label }, language);
+    let notice = if duplicate {
+        CodexLoginNotice::Duplicate { label: &label }
+    } else {
+        let hidden = lock_state().as_ref().is_some_and(|s| !s.show_codex);
+        CodexLoginNotice::Added {
+            label: &label,
+            hidden,
+        }
+    };
+    notify_codex_account(hwnd, notice, language);
 }
 
 fn start_poll(hwnd: SendHwnd, queue: bool) {
@@ -4519,6 +5007,32 @@ unsafe extern "system" fn wnd_proc(
                 }
                 IDM_CODEX_ACCOUNT_ADD => toggle_codex_account_login(hwnd),
                 IDM_CODEX_ACCOUNT_REMOVE => remove_active_codex_login(hwnd),
+                id if (IDM_CODEX_RESTORE_FIRST
+                    ..IDM_CODEX_RESTORE_FIRST + MAX_CODEX_ACCOUNT_MENU_ITEMS as u16)
+                    .contains(&id) =>
+                {
+                    let result = {
+                        let mut state = lock_state();
+                        state.as_mut().and_then(|s| {
+                            if s.pending_codex_login.is_some()
+                                || s.codex_logins.len() >= MAX_CODEX_ACCOUNT_MENU_ITEMS
+                            {
+                                return None;
+                            }
+                            let home = s
+                                .saved_codex_profile_menu
+                                .get((id - IDM_CODEX_RESTORE_FIRST) as usize)?
+                                .clone();
+                            if !poller::codex_profile_ready(&home) {
+                                return None;
+                            }
+                            Some((s.language, register_codex_login(s, &home)))
+                        })
+                    };
+                    if let Some((language, outcome)) = result {
+                        finish_codex_login(hwnd, language, outcome);
+                    }
+                }
                 id if (IDM_CODEX_ACCOUNT_FIRST
                     ..IDM_CODEX_ACCOUNT_FIRST + MAX_CODEX_ACCOUNT_MENU_ITEMS as u16)
                     .contains(&id) =>
@@ -4819,18 +5333,28 @@ fn show_context_menu(hwnd: HWND) {
 
         // Codex accounts submenu. Listed whenever the app has state, because this
         // is also where another login is added, even while Codex is hidden.
-        let (codex_account_labels, codex_active_account, codex_login_pending) = {
-            let state = lock_state();
-            match state.as_ref() {
-                Some(s) => (
-                    s.codex_logins
-                        .iter()
-                        .map(|login| login.display_label.clone())
-                        .collect::<Vec<_>>(),
-                    s.active_codex_account,
-                    s.pending_codex_login.is_some(),
-                ),
-                None => (Vec::new(), 0, false),
+        let (codex_account_labels, codex_active_account, codex_login_pending, saved_profiles) = {
+            let mut state = lock_state();
+            match state.as_mut() {
+                Some(s) => {
+                    s.saved_codex_profile_menu = saved_codex_profiles(
+                        &profile_base_dir(),
+                        &s.codex_logins,
+                        s.pending_codex_login
+                            .as_ref()
+                            .map(|pending| pending.home.as_path()),
+                    );
+                    (
+                        s.codex_logins
+                            .iter()
+                            .map(|login| login.display_label.clone())
+                            .collect::<Vec<_>>(),
+                        s.active_codex_account,
+                        s.pending_codex_login.is_some(),
+                        s.saved_codex_profile_menu.clone(),
+                    )
+                }
+                None => (Vec::new(), 0, false, Vec::new()),
             }
         };
         if !codex_account_labels.is_empty() {
@@ -4857,6 +5381,37 @@ fn show_context_menu(hwnd: HWND) {
             }
             let _ = AppendMenuW(accounts_menu, MF_SEPARATOR, 0, PCWSTR::null());
             let account_strings = language.strings().codex_accounts;
+            if !saved_profiles.is_empty() {
+                let restore_menu = CreatePopupMenu().unwrap();
+                for (index, home) in saved_profiles.iter().enumerate() {
+                    let login = CodexLogin::profile(String::new(), home.clone());
+                    let label = native_interop::wide_str(&menu_text(&format!(
+                        "{} ({})",
+                        truncate_label(&login.display_label),
+                        folder_name(Some(home))
+                    )));
+                    let _ = AppendMenuW(
+                        restore_menu,
+                        MENU_ITEM_FLAGS(0),
+                        (IDM_CODEX_RESTORE_FIRST + index as u16) as usize,
+                        PCWSTR::from_raw(label.as_ptr()),
+                    );
+                }
+                let label = native_interop::wide_str(account_strings.restore);
+                let flags = if codex_login_pending
+                    || codex_account_labels.len() >= MAX_CODEX_ACCOUNT_MENU_ITEMS
+                {
+                    MF_POPUP | MF_GRAYED
+                } else {
+                    MF_POPUP
+                };
+                let _ = AppendMenuW(
+                    accounts_menu,
+                    flags,
+                    restore_menu.0 as usize,
+                    PCWSTR::from_raw(label.as_ptr()),
+                );
+            }
             // While a sign-in is running the same item stops waiting for it, so a
             // failed attempt never leaves the menu without a way forward.
             let add_label = native_interop::wide_str(if codex_login_pending {
@@ -5683,18 +6238,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn powershell_path_escapes_ascii_and_typographic_apostrophes() {
-        assert_eq!(
-            powershell_path("C:\\Profiles\\O’Brien\\User‘s\\Other‚s\\Last‛s"),
-            "C:\\Profiles\\O’’Brien\\User‘‘s\\Other‚‚s\\Last‛‛s"
-        );
-        assert_eq!(
-            powershell_path("C:\\Profiles\\O'Brien"),
-            "C:\\Profiles\\O''Brien"
-        );
-    }
-
-    #[test]
     fn unavailable_quota_has_no_bar_fill() {
         assert_eq!(usage_bar_fill_percentage(100.0, "--"), 0.0);
         assert_eq!(usage_bar_fill_percentage(61.0, "剩余61%"), 61.0);
@@ -6275,7 +6818,7 @@ mod tests {
         // Profile folders are numbered from 2, so the first free one is chosen.
         assert_eq!(
             next_profile_home(base, |_| false),
-            PathBuf::from(r"C:\Users\Ray\.codex-account2")
+            Some(PathBuf::from(r"C:\Users\Ray\.codex-account2"))
         );
         // A directory that exists on disk or is already monitored is skipped
         // rather than shared between two logins.
@@ -6283,8 +6826,354 @@ mod tests {
             next_profile_home(base, |candidate| {
                 candidate.ends_with(".codex-account2") || candidate.ends_with(".codex-account3")
             }),
-            PathBuf::from(r"C:\Users\Ray\.codex-account4")
+            Some(PathBuf::from(r"C:\Users\Ray\.codex-account4"))
         );
+        assert_eq!(next_profile_home(base, |_| true), None);
+    }
+
+    struct TestCodexProfiles(PathBuf);
+
+    impl TestCodexProfiles {
+        fn new() -> Self {
+            let base = std::env::var_os("LOCALAPPDATA")
+                .map(|base| PathBuf::from(base).join("Temp").join("opencode"))
+                .unwrap_or_else(std::env::temp_dir)
+                .join(format!(
+                    "codex-profile-tests-{}-{}",
+                    std::process::id(),
+                    SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+            std::fs::create_dir_all(&base).unwrap();
+            Self(base)
+        }
+
+        fn profile(&self, folder: &str, account_id: &str, id_token: &str) -> PathBuf {
+            let home = self.0.join(folder);
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::write(
+                home.join("auth.json"),
+                serde_json::json!({
+                    "tokens": { "access_token": "test-only", "account_id": account_id,
+                        "id_token": id_token }
+                })
+                .to_string(),
+            )
+            .unwrap();
+            home
+        }
+    }
+
+    impl Drop for TestCodexProfiles {
+        fn drop(&mut self) {
+            if let Err(error) = std::fs::remove_dir_all(&self.0) {
+                eprintln!(
+                    "unable to clean up test profiles {}: {error}",
+                    self.0.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_account_identity_does_not_merge_unrelated_profiles() {
+        let profiles = TestCodexProfiles::new();
+        let first = profiles.profile("first", "", "");
+        let other = profiles.profile("other", "", "");
+        let logins = vec![CodexLogin::profile("same label".into(), first.clone())];
+        assert_eq!(poller::codex_account_identity(&logins[0].account()), None);
+        assert_eq!(matching_codex_login(&logins, &other), None);
+        assert_eq!(matching_codex_login(&logins, &first), Some(0));
+        std::fs::write(other.join("auth.json"), "incomplete JSON").unwrap();
+        assert_eq!(matching_codex_login(&logins, &other), None);
+    }
+
+    #[test]
+    fn duplicate_accounts_in_different_folders_select_the_existing_login() {
+        let profiles = TestCodexProfiles::new();
+        let first = profiles.profile("first", "account-a", "x.eyJzdWIiOiJ1c2VyLWEifQ.x");
+        let duplicate = profiles.profile("duplicate", "account-a", "x.eyJzdWIiOiJ1c2VyLWEifQ.x");
+        let other = profiles.profile("other", "account-b", "x.eyJzdWIiOiJ1c2VyLWEifQ.x");
+        let logins = vec![CodexLogin::profile("first".into(), first.clone())];
+        assert_eq!(matching_codex_login(&logins, &duplicate), Some(0));
+        assert_eq!(matching_codex_login(&logins, &other), None);
+
+        let settings = normalize_settings(SettingsFile {
+            codex_accounts: vec![
+                CodexAccountSetting {
+                    label: "first".into(),
+                    codex_home: first.display().to_string(),
+                },
+                CodexAccountSetting {
+                    label: "duplicate".into(),
+                    codex_home: duplicate.display().to_string(),
+                },
+            ],
+            active_codex_account: 2,
+            ..SettingsFile::default()
+        });
+        assert_eq!(settings.codex_accounts.len(), 1);
+        assert_eq!(settings.active_codex_account, 1);
+        // Deduplication must never delete either CLI's credentials.
+        assert!(first.join("auth.json").is_file());
+        assert!(duplicate.join("auth.json").is_file());
+    }
+
+    #[test]
+    fn missing_subject_does_not_merge_workspace_members() {
+        let profiles = TestCodexProfiles::new();
+        let first = profiles.profile("first", "workspace", "");
+        let other = profiles.profile("other", "workspace", "");
+        let logins = vec![CodexLogin::profile(String::new(), first.clone())];
+        assert_eq!(matching_codex_login(&logins, &other), None);
+
+        let settings = normalize_settings(SettingsFile {
+            codex_accounts: vec![
+                CodexAccountSetting {
+                    label: "first".into(),
+                    codex_home: first.display().to_string(),
+                },
+                CodexAccountSetting {
+                    label: "other".into(),
+                    codex_home: other.display().to_string(),
+                },
+            ],
+            ..SettingsFile::default()
+        });
+        assert_eq!(settings.codex_accounts.len(), 2);
+    }
+
+    #[test]
+    fn different_workspace_members_are_not_duplicate_accounts() {
+        let profiles = TestCodexProfiles::new();
+        let first = profiles.profile("first", "workspace", "x.eyJzdWIiOiJ1c2VyLWEifQ.x");
+        let other = profiles.profile("other", "workspace", "x.eyJzdWIiOiJ1c2VyLWIifQ.x");
+        let duplicate = profiles.profile("duplicate", "workspace", "x.eyJzdWIiOiJ1c2VyLWEifQ.x");
+        let logins = vec![CodexLogin::profile(String::new(), first.clone())];
+        assert_eq!(
+            poller::codex_account_identity(&logins[0].account()),
+            Some(("workspace".into(), Some("user-a".into())))
+        );
+        assert_eq!(matching_codex_login(&logins, &other), None);
+        assert_eq!(matching_codex_login(&logins, &duplicate), Some(0));
+    }
+
+    #[test]
+    fn unfinished_attempts_do_not_consume_numbered_profile_folders() {
+        let profiles = TestCodexProfiles::new();
+        let registered = profiles.0.join(".codex-account2");
+        let logins = vec![CodexLogin::profile(String::new(), registered.clone())];
+        let abandoned = reserve_login_home(&profiles.0).unwrap();
+        let retry = reserve_login_home(&profiles.0).unwrap();
+        assert_ne!(abandoned, registered);
+        assert_ne!(retry, abandoned);
+        assert_ne!(retry, registered);
+        assert!(!registered.exists());
+        // The original CLI may finish later, without changing the new attempt.
+        assert!(publish_profile_home(&profiles.0, &retry, &logins).is_err());
+        assert!(!profiles.0.join(".codex-account3").exists());
+        std::fs::write(
+            abandoned.join("auth.json"),
+            r#"{"tokens":{"access_token":"test-only","account_id":"late-account"}}"#,
+        )
+        .unwrap();
+        assert!(!poller::codex_profile_ready(&retry));
+        assert!(saved_codex_profiles(&profiles.0, &logins, Some(&retry)).contains(&abandoned));
+        let published = publish_profile_home(&profiles.0, &abandoned, &logins).unwrap();
+        assert_eq!(published, profiles.0.join(".codex-account3"));
+        assert!(poller::codex_profile_ready(&published));
+        assert!(!abandoned.exists());
+        assert!(retry.exists());
+    }
+
+    #[test]
+    fn removing_and_readding_a_managed_profile_does_not_restore_deleted_credentials() {
+        let profiles = TestCodexProfiles::new();
+        let main = profiles.profile(".codex", "main", "");
+        let home = profiles.profile(".codex-account2", "extra", "");
+        let protected = vec![main.clone()];
+        let target = managed_profile_for_removal(&profiles.0, &home, &protected)
+            .unwrap()
+            .unwrap();
+        delete_managed_profile(&target).unwrap();
+        assert!(!home.exists());
+        assert!(poller::codex_profile_ready(&main));
+        assert!(saved_codex_profiles(&profiles.0, &[], None).is_empty());
+        // A retry can use the freed number, but only once authentication succeeds.
+        let staged = reserve_login_home(&profiles.0).unwrap();
+        std::fs::write(
+            staged.join("auth.json"),
+            r#"{"tokens":{"access_token":"new-token","account_id":"extra"}}"#,
+        )
+        .unwrap();
+        let added = publish_profile_home(&profiles.0, &staged, &[]).unwrap();
+        assert_eq!(added, home);
+        assert!(poller::codex_profile_ready(&added));
+        delete_managed_profile(&added).unwrap();
+        delete_managed_profile(&added).unwrap(); // Already missing is a success.
+        assert!(saved_codex_profiles(&profiles.0, &[], None).is_empty());
+        assert!(main.join("auth.json").is_file());
+    }
+
+    #[test]
+    fn profile_removal_protects_default_custom_shared_and_nested_homes() {
+        let profiles = TestCodexProfiles::new();
+        let managed = profiles.profile(".codex-account2", "extra", "");
+        for protected in [managed.clone(), managed.join("nested"), profiles.0.clone()] {
+            assert!(
+                managed_profile_for_removal(&profiles.0, &managed, &[protected])
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        for name in [
+            ".codex",
+            "custom",
+            ".codex-account",
+            ".codex-account1",
+            ".codex-account02",
+            ".codex-account1000",
+        ] {
+            let home = profiles.profile(name, "protected", "");
+            assert!(managed_profile_for_removal(&profiles.0, &home, &[])
+                .unwrap()
+                .is_none());
+            assert!(home.join("auth.json").is_file());
+        }
+        let external = TestCodexProfiles::new();
+        let home = external.profile(".codex-account2", "external", "");
+        assert!(managed_profile_for_removal(&profiles.0, &home, &[])
+            .unwrap()
+            .is_none());
+        assert!(home.join("auth.json").is_file());
+        assert!(managed.join("auth.json").is_file());
+    }
+
+    #[test]
+    fn locked_profile_deletion_reports_failure_and_can_be_retried() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let profiles = TestCodexProfiles::new();
+        let home = profiles.profile(".codex-account2", "extra", "");
+        let locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(home.join("auth.json"))
+            .unwrap();
+        assert!(delete_managed_profile(&home).is_err());
+        assert!(home.exists());
+        drop(locked);
+        assert!(poller::codex_profile_ready(&home));
+        delete_managed_profile(&home).unwrap();
+        assert!(!home.exists());
+    }
+
+    #[test]
+    fn profile_removal_does_not_follow_root_or_nested_junctions() {
+        let profiles = TestCodexProfiles::new();
+        let external = TestCodexProfiles::new();
+        let main = external.profile("main", "main", "");
+        let alias = profiles.0.join(".codex-account2");
+        let home = profiles.profile(".codex-account3", "extra", "");
+        for junction in [&alias, &home.join("linked-main")] {
+            let output = std::process::Command::new("cmd.exe")
+                .args(["/c", "mklink", "/J"])
+                .arg(junction)
+                .arg(&main)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert!(managed_profile_for_removal(&profiles.0, &alias, &[])
+            .unwrap()
+            .is_none());
+        assert!(
+            managed_profile_for_removal(&profiles.0, &home, std::slice::from_ref(&main))
+                .unwrap()
+                .is_some()
+        );
+        delete_managed_profile(&home).unwrap();
+        assert!(main.join("auth.json").is_file());
+        assert!(poller::codex_profile_ready(&main));
+    }
+
+    #[test]
+    fn saved_profile_menu_restores_removed_and_late_logins_but_excludes_pending_and_duplicates() {
+        let profiles = TestCodexProfiles::new();
+        let monitored = profiles.profile(
+            ".codex-account2",
+            "monitored",
+            "x.eyJzdWIiOiJtb25pdG9yZWQifQ.x",
+        );
+        profiles.profile(
+            ".codex-account3",
+            "monitored",
+            "x.eyJzdWIiOiJtb25pdG9yZWQifQ.x",
+        );
+        let removed = profiles.profile(".codex-account4", "removed", "");
+        let late = profiles.profile(".codex-account5", "late", "");
+        let pending = profiles.profile(".codex-account6", "pending", "");
+        profiles.profile("unrelated", "unrelated", "");
+        profiles.profile(".codex-account7", "", "");
+        let logins = vec![CodexLogin::profile(String::new(), monitored)];
+        let saved = saved_codex_profiles(&profiles.0, &logins, Some(&pending));
+        assert!(saved.contains(&removed));
+        assert!(saved.contains(&late));
+        assert!(!saved.contains(&pending));
+        assert!(!saved.iter().any(|home| home.ends_with(".codex-account3")));
+        assert!(!saved.iter().any(|home| home.ends_with("unrelated")));
+        let restored = vec![
+            logins[0].clone(),
+            CodexLogin::profile(String::new(), removed.clone()),
+        ];
+        assert!(!saved_codex_profiles(&profiles.0, &restored, Some(&pending)).contains(&removed));
+    }
+
+    #[test]
+    fn path_aliases_and_missing_parent_components_do_not_create_duplicate_slots() {
+        let profiles = TestCodexProfiles::new();
+        let home = profiles.profile("real", "", "");
+        assert_eq!(path_identity(&home), path_identity(&home.join(".")));
+        assert_eq!(
+            path_identity(&profiles.0.join("unused/../real")),
+            path_identity(&home)
+        );
+        assert_eq!(
+            path_identity(&profiles.0.join("missing/../other")),
+            path_identity(&profiles.0.join("other"))
+        );
+        // Directory junctions do not require developer mode or administrator rights.
+        let alias = profiles.0.join("alias");
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/c", "mklink", "/J"])
+            .arg(&alias)
+            .arg(&home)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(path_identity(&alias), path_identity(&home));
+        let normalized = normalize_codex_accounts(vec![
+            CodexAccountSetting {
+                label: "real".into(),
+                codex_home: home.display().to_string(),
+            },
+            CodexAccountSetting {
+                label: "alias".into(),
+                codex_home: alias.display().to_string(),
+            },
+        ]);
+        assert_eq!(normalized.len(), 1);
+        std::fs::remove_dir(alias).unwrap();
     }
 
     #[test]
@@ -6314,11 +7203,10 @@ mod tests {
             codex_main_label("ray@example.com", LanguageId::SimplifiedChinese),
             "ray@example.com（主账号）"
         );
-        // Languages without their own marker keep the English one, like the
-        // other strings added without a new locale entry.
+        // Account labels use the selected language's own main-account marker.
         assert_eq!(
             codex_main_label("Codex", LanguageId::Japanese),
-            "Codex (main)"
+            "Codex（メイン）"
         );
     }
 
@@ -6363,6 +7251,7 @@ mod tests {
             label: "work".into(),
             active: false,
             has_data: true,
+            has_error: false,
             session_text: "62%".into(),
             weekly_text: "18%".into(),
             detail: "Last updated 12:00:00".into(),
@@ -6391,43 +7280,35 @@ mod tests {
         for language in LanguageId::ALL {
             let strings = language.strings().codex_accounts;
             let cases = [
+                (CodexLoginNotice::Started, strings.title, strings.started),
                 (
-                    CodexLoginNotice::Started {
-                        folder: "profile-2",
-                    },
+                    CodexLoginNotice::Cancelled,
                     strings.title,
-                    "profile-2",
-                ),
-                (
-                    CodexLoginNotice::Cancelled {
-                        folder: "profile-2",
-                    },
-                    strings.title,
-                    "profile-2",
+                    strings.cancelled,
                 ),
                 (
                     CodexLoginNotice::Added {
                         label: "work {path}",
+                        hidden: false,
                     },
                     strings.added_title,
                     "work {path}",
                 ),
                 (
-                    CodexLoginNotice::TimedOut {
-                        path: r"C:\Profiles\work",
-                    },
+                    CodexLoginNotice::TimedOut,
                     strings.timed_out_title,
-                    r"C:\Profiles\work",
+                    strings.timed_out,
                 ),
                 (
-                    CodexLoginNotice::Failed {
-                        path: r"C:\Profiles\work",
-                    },
+                    CodexLoginNotice::Failed,
                     strings.failed_title,
-                    r"C:\Profiles\work",
+                    strings.failed,
                 ),
                 (
-                    CodexLoginNotice::Removed { label: "work" },
+                    CodexLoginNotice::Removed {
+                        label: "work",
+                        deleted: false,
+                    },
                     strings.removed_title,
                     "work",
                 ),
@@ -6442,23 +7323,130 @@ mod tests {
     }
 
     #[test]
-    fn codex_profile_reauthentication_is_localized_and_powershell_escaped() {
+    fn codex_reauthentication_notices_are_localized_without_help_links() {
         let account =
             poller::CodexAccount::profile("work", PathBuf::from(r"C:\Users\O'Brien\codex work"));
         for language in LanguageId::ALL {
             let body = codex_auth_notice_body(language.strings(), &account);
-            assert!(
-                body.contains("$env:CODEX_HOME = 'C:\\Users\\O''Brien\\codex work'; codex login")
-            );
+            assert_eq!(body, language.strings().codex_accounts.reauthenticate);
+            assert!(body.encode_utf16().count() < 256);
             assert!(!body.contains("{path}"));
+            assert!(!body.contains("{help}"));
         }
-        let (title, body) = codex_login_notice(
-            LanguageId::SimplifiedChinese,
-            CodexLoginNotice::Failed {
-                path: r"C:\Users\O'Brien\codex work",
-            },
-        );
+        let (title, body) =
+            codex_login_notice(LanguageId::SimplifiedChinese, CodexLoginNotice::Failed);
         assert_eq!(title, "无法启动 Codex 登录");
-        assert!(body.contains("O''Brien"));
+        assert_eq!(
+            body,
+            LanguageId::SimplifiedChinese
+                .strings()
+                .codex_accounts
+                .failed
+        );
+    }
+
+    #[test]
+    fn account_progress_is_not_a_folder_count_and_normal_events_are_informational() {
+        for language in LanguageId::ALL {
+            for notice in [
+                CodexLoginNotice::Started,
+                CodexLoginNotice::Cancelled,
+                CodexLoginNotice::Added {
+                    label: "work",
+                    hidden: false,
+                },
+                CodexLoginNotice::Duplicate { label: "work" },
+                CodexLoginNotice::Removed {
+                    label: "work",
+                    deleted: false,
+                },
+            ] {
+                assert_eq!(
+                    codex_notice_severity(&notice),
+                    tray_icon::NoticeSeverity::Information
+                );
+                let (_, body) = codex_login_notice(language, notice);
+                assert!(!body.contains(".codex-account"));
+                assert!(!body.contains("{folder}"));
+            }
+            for notice in [
+                CodexLoginNotice::Failed,
+                CodexLoginNotice::TimedOut,
+                CodexLoginNotice::Limit,
+            ] {
+                assert_eq!(
+                    codex_notice_severity(&notice),
+                    tray_icon::NoticeSeverity::Warning
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hidden_codex_success_explains_how_to_display_the_selected_account() {
+        for language in LanguageId::ALL {
+            let (_, body) = codex_login_notice(
+                language,
+                CodexLoginNotice::Added {
+                    label: "work",
+                    hidden: true,
+                },
+            );
+            let hidden = language
+                .strings()
+                .codex_accounts
+                .hidden
+                .replace("{models}", language.strings().models);
+            assert!(body.contains(&hidden));
+            assert!(body.contains(language.strings().models));
+            assert!(!body.contains("{models}"));
+            let (_, visible) = codex_login_notice(
+                language,
+                CodexLoginNotice::Added {
+                    label: "work",
+                    hidden: false,
+                },
+            );
+            assert!(!visible.contains(&hidden));
+        }
+    }
+
+    #[test]
+    fn reservation_and_missing_cli_failures_never_offer_an_invalid_login_command() {
+        for language in LanguageId::ALL {
+            let text = codex_start_failure_details(language, None, "permission denied", false);
+            assert!(text.contains(language.strings().codex_accounts.profile_failed));
+            assert!(text.contains("permission denied"));
+            assert!(!text.contains("$env:CODEX_HOME"));
+            let text = codex_start_failure_details(
+                language,
+                Some(Path::new(r"C:\Profiles\work")),
+                "not found",
+                true,
+            );
+            assert!(text.contains(language.strings().codex_accounts.missing_cli));
+            assert!(!text.contains("$env:CODEX_HOME"));
+        }
+    }
+
+    #[test]
+    fn recovery_hints_explain_mismatch_and_authentication_errors() {
+        for language in LanguageId::ALL {
+            let hint =
+                codex_recovery_hint(language, Some(poller::PollError::AccountMismatch)).unwrap();
+            assert_eq!(hint, language.strings().codex_accounts.mismatch);
+            assert!(!hint.contains("account_mismatch"));
+            for error in [
+                poller::PollError::AuthRequired,
+                poller::PollError::NoCredentials,
+                poller::PollError::TokenExpired,
+            ] {
+                assert_eq!(
+                    codex_recovery_hint(language, Some(error)).unwrap(),
+                    language.strings().codex_accounts.reauthenticate
+                );
+            }
+            assert!(codex_recovery_hint(language, None).is_none());
+        }
     }
 }

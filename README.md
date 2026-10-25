@@ -120,9 +120,14 @@ Claude Desktop and Claude Code CLI use separate local sessions. Signing in to Cl
 The widget shows one Codex login at a time. Right-click the widget or the tray icon and open **Codex accounts** to manage the rest:
 
 - **Add account…** starts `codex login` for a new profile folder (`~/.codex-account2`, `~/.codex-account3`, …) and then waits for its credentials. The Codex CLI opens its own console and your browser: finish the sign-in there and the login is added and selected automatically. Nothing is added when the sign-in does not finish within five minutes. Up to 39 Codex logins (including the default) can be monitored, so once that many are configured this menu entry reports the limit instead of starting a sign-in; extra entries in `codex_accounts` are ignored.
-- While that sign-in is running, the same menu entry reads **Cancel sign-in**. Choosing it stops waiting for the credentials, which is useful when the Codex window already reported an error. The console window usually stays open so its messages remain readable; close it when you are done.
+- While that sign-in is running, the same menu entry reads **Stop waiting for sign-in**. This stops the monitor's wait, not the CLI or browser. Close abandoned Codex windows yourself.
 - Pick any listed login to move the widget to it. The choice is saved, so it survives a restart.
-- **Remove account: …** appears for the login the widget currently shows, never for your default login. Removing only stops monitoring; the profile folder and its credentials are left untouched.
+- **Remove account: …** appears for the login the widget currently shows, never for your default login. For app-managed numbered profiles directly under your home directory, confirmation permanently deletes the folder and credentials; signing in again is required. Custom folders, links/junctions and folders shared with another configured login are only unregistered, not deleted. If deletion fails, the account stays monitored so you can close any Codex windows using it and retry.
+- **Use saved profile** lists authenticated profiles that are not currently monitored, including logins saved by older versions or completed after cancellation or the five-minute timeout. Deleted profiles cannot be restored; use **Add account…** to sign in again. The menu is unavailable while another sign-in is pending or the account limit is reached.
+
+Signing into an account already monitored selects its existing entry instead of adding a duplicate, and the duplicate staged attempt is discarded when possible. Matching uses the stored account ID and, when available, user subject rather than the display email. Duplicate settings entries and paths that resolve to the same directory are also filtered. Each new sign-in reserves a fresh staging folder, so an older CLI window cannot overwrite a retry's credentials; close abandoned CLI windows yourself.
+
+Sign-in attempts start in separate folders under `~/.codex-login-attempts`, not in numbered account folders. Only a completed, nonduplicate login is moved to the next available `~/.codex-account<N>` folder. Unfinished attempts remain in the staging area because their CLI windows can still finish; **Use saved profile** also finds completed staged logins. Existing folders are never overwritten; numbers freed by removal can be used for a new successful sign-in. A duplicate sign-in does not replace the existing profile's credentials. To reconnect an extra account, remove it and add it again. For your default login, run `codex login` in Codex CLI and refresh the app. Adding an account while Codex is hidden selects it without enabling Codex; enable it under **Monitored services** to display it.
 
 What the multi-account view gives you:
 
@@ -138,11 +143,22 @@ Extra logins can also be added by hand in `%APPDATA%\CodexUsage\settings.json`, 
 
     ```powershell
     New-Item -ItemType Directory -Force "$env:USERPROFILE\.codex-work" | Out-Null
-    $env:CODEX_HOME = "$env:USERPROFILE\.codex-work"
-    codex login
+    & {
+        $previousHome = $env:CODEX_HOME
+        try {
+            $env:CODEX_HOME = "$env:USERPROFILE\.codex-work"
+            codex login
+        } finally {
+            if ($null -eq $previousHome) {
+                Remove-Item Env:CODEX_HOME -ErrorAction SilentlyContinue
+            } else {
+                $env:CODEX_HOME = $previousHome
+            }
+        }
+    }
     ```
 
-    The directory has to exist first: `codex login` refuses to start with `CODEX_HOME points to … but that path does not exist`. Keep `CODEX_HOME` set for the `codex login` command. Without it, `codex login` signs in to your default login instead.
+    The directory has to exist first: `codex login` refuses to start with `CODEX_HOME points to … but that path does not exist`. The script sets `CODEX_HOME` only for this sign-in and restores its previous value even on failure, so subsequently launching the monitor from the same shell does not change its default account.
 
 2. List the profile:
 

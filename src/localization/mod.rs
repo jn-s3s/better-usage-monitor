@@ -147,21 +147,32 @@ mod tests {
     use super::LanguageId;
 
     #[test]
-    fn codex_account_translations_have_explicit_english_fallbacks() {
-        let english = LanguageId::English.strings().codex_accounts;
+    fn codex_account_translations_have_complete_templates() {
         for language in LanguageId::ALL {
             let strings = language.strings().codex_accounts;
             assert!(strings.remove.contains("{label}"));
-            assert!(strings.started.contains("{folder}"));
+            assert!(strings.remove_confirm.contains("{label}"));
+            assert!(strings.remove_confirm.contains("{path}"));
+            assert!(strings.remove_failed.contains("{error}"));
+            assert!(strings.removed_deleted.contains("{label}"));
+            assert!(strings.duplicate.contains("{label}"));
+            assert!(!strings.restore.is_empty());
+            assert!(!strings.started.contains("{folder}"));
+            assert!(!strings.cancelled.contains("{folder}"));
             assert!(strings.limit.contains("{limit}"));
-            assert!(strings.reauthenticate.contains("{path}"));
-            if !matches!(
-                language,
-                LanguageId::English | LanguageId::SimplifiedChinese
-            ) {
-                assert_eq!(strings.menu, english.menu);
-                assert_eq!(strings.reauthenticate, english.reauthenticate);
+            assert!(!strings.reauthenticate.is_empty());
+            assert!(!strings.reauthenticate.contains("{help}"));
+            assert!(!strings.failed.is_empty());
+            assert!(!strings.failed.contains("{help}"));
+            for value in [
+                strings.hidden,
+                strings.profile_failed,
+                strings.missing_cli,
+                strings.mismatch,
+            ] {
+                assert!(!value.is_empty());
             }
+            assert!(strings.hidden.contains("{models}"));
         }
         assert_eq!(
             LanguageId::SimplifiedChinese.strings().codex_accounts.menu,
@@ -206,6 +217,8 @@ mod tests {
 pub struct CodexAccountStrings {
     pub menu: &'static str,
     pub add: &'static str,
+    pub restore: &'static str,
+    pub duplicate: &'static str,
     pub cancel: &'static str,
     pub remove: &'static str,
     pub main_suffix: &'static str,
@@ -220,9 +233,16 @@ pub struct CodexAccountStrings {
     pub failed: &'static str,
     pub removed_title: &'static str,
     pub removed: &'static str,
+    pub remove_confirm: &'static str,
+    pub remove_failed: &'static str,
+    pub removed_deleted: &'static str,
     pub limit_title: &'static str,
     pub limit: &'static str,
     pub reauthenticate: &'static str,
+    pub hidden: &'static str,
+    pub profile_failed: &'static str,
+    pub missing_cli: &'static str,
+    pub mismatch: &'static str,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -267,7 +287,6 @@ pub struct Strings {
     pub token_expired_title: &'static str,
     pub token_expired_body: &'static str,
     pub codex_token_expired_title: &'static str,
-    pub codex_token_expired_body: &'static str,
     pub antigravity_token_expired_title: &'static str,
     pub antigravity_token_expired_body: &'static str,
     pub codex_window_title: &'static str,

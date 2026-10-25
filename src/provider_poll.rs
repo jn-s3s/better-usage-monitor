@@ -533,6 +533,8 @@ impl Service {
                     PollError::ServerError => "服务暂时不可用",
                     PollError::RequestFailed => "无法读取额度响应",
                 }
+            } else if error == PollError::AccountMismatch {
+                "the returned account does not match this saved profile"
             } else {
                 error.category()
             };

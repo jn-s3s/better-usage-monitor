@@ -2,8 +2,8 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
 use windows::Win32::UI::Shell::{
-    ExtractIconExW, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_WARNING,
-    NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
+    ExtractIconExW, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO,
+    NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -34,6 +34,12 @@ pub enum TrayIconKind {
 
 pub struct TrayIconData {
     pub tooltip: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoticeSeverity {
+    Information,
+    Warning,
 }
 
 /// Load the same embedded icon used by the executable and desktop shortcut.
@@ -76,13 +82,25 @@ fn load_embedded_app_icon() -> HICON {
 
 /// Show a Windows balloon notification from the single application tray icon.
 pub fn notify_balloon(hwnd: HWND, _kind: TrayIconKind, title: &str, message: &str) {
+    notify_balloon_with_severity(hwnd, title, message, NoticeSeverity::Warning);
+}
+
+pub fn notify_balloon_with_severity(
+    hwnd: HWND,
+    title: &str,
+    message: &str,
+    severity: NoticeSeverity,
+) {
     unsafe {
         let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
         nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
         nid.hWnd = hwnd;
         nid.uID = APP_TRAY_ICON_ID;
         nid.uFlags = NIF_INFO;
-        nid.dwInfoFlags = NIIF_WARNING;
+        nid.dwInfoFlags = match severity {
+            NoticeSeverity::Information => NIIF_INFO,
+            NoticeSeverity::Warning => NIIF_WARNING,
+        };
         copy_wide(title, &mut nid.szInfoTitle);
         copy_wide(message, &mut nid.szInfo);
         let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);

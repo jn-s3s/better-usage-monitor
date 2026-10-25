@@ -322,7 +322,7 @@ fn poll_codex(account: &CodexAccount) -> Result<UsageData, PollError> {
     match fetch_codex_usage(&creds.access_token, creds.account_id.as_deref(), strict) {
         Ok(data) => Ok(data),
         Err(PollError::AuthRequired) => {
-            cli_refresh_codex_token(account);
+            cli_refresh_codex_token(account, &creds.access_token);
             let refreshed = read_codex_credentials(account).ok_or(PollError::TokenExpired)?;
             fetch_codex_usage(
                 &refreshed.access_token,
@@ -460,20 +460,47 @@ fn cli_refresh_wsl_token(distro: &str) {
     wait_for_refresh(&mut child);
 }
 
-fn cli_refresh_codex_token(account: &CodexAccount) {
-    let codex_path = resolve_windows_codex_path();
-    let is_cmd = codex_path.to_lowercase().ends_with(".cmd");
-    let is_ps1 = codex_path.to_lowercase().ends_with(".ps1");
+/// Serializes profile deletion with CLI refreshes, which can write credentials.
+pub static CODEX_PROFILE_WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn codex_refresh_is_current(account: &CodexAccount, expected_token: &str) -> bool {
+    read_codex_credentials(account)
+        .is_some_and(|credentials| credentials.access_token == expected_token)
+}
+
+fn cli_refresh_codex_token(account: &CodexAccount, expected_token: &str) {
+    let _profile_write = CODEX_PROFILE_WRITES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // A poll can finish after its profile was removed. Never let its refresh
+    // recreate a deleted home (or fall back to the main account).
+    if !codex_refresh_is_current(account, expected_token) {
+        return;
+    }
+    let codex_path = match resolve_windows_codex_path() {
+        Ok(path) => path,
+        Err(error) => {
+            diagnose::log_error("unable to find Codex CLI for token refresh", error);
+            return;
+        }
+    };
+    let extension = codex_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let is_cmd = extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat");
+    let is_ps1 = extension.eq_ignore_ascii_case("ps1");
     diagnose::log(format!(
-        "attempting Windows Codex token refresh for {} via {codex_path}",
-        account.label
+        "attempting Windows Codex token refresh for {} via {}",
+        account.label,
+        codex_path.display()
     ));
 
     let args: &[&str] = &["exec", "."];
 
     let mut cmd = if is_cmd {
         let mut c = Command::new("cmd.exe");
-        c.arg("/c").arg(&codex_path).args(args);
+        configure_cmd_script(&mut c, &codex_path, args, "/c");
         c
     } else if is_ps1 {
         let mut c = Command::new("powershell.exe");
@@ -520,20 +547,24 @@ pub fn spawn_codex_login(home: &Path) -> std::io::Result<()> {
     // The CLI refuses to load a configuration from a missing directory, so the
     // profile folder has to exist before it starts.
     std::fs::create_dir_all(home)?;
-    let codex_path = resolve_windows_codex_path();
-    let lower = codex_path.to_lowercase();
-    let is_script = lower.ends_with(".cmd") || lower.ends_with(".bat");
-    let is_ps1 = lower.ends_with(".ps1");
+    let codex_path = resolve_windows_codex_path()?;
+    let extension = codex_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let is_script = extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat");
+    let is_ps1 = extension.eq_ignore_ascii_case("ps1");
     diagnose::log(format!(
-        "starting Codex login for {} via {codex_path}",
-        home.display()
+        "starting Codex login for {} via {}",
+        home.display(),
+        codex_path.display()
     ));
 
     let mut cmd = if is_script {
         // `/k` keeps the CLI's output on screen instead of letting the window
         // flash past when the sign-in fails.
         let mut c = Command::new("cmd.exe");
-        c.arg("/k").arg(&codex_path).arg("login");
+        configure_cmd_script(&mut c, &codex_path, &["login"], "/k");
         c
     } else if is_ps1 {
         let mut c = Command::new("powershell.exe");
@@ -640,39 +671,61 @@ fn resolve_windows_claude_path() -> String {
     "claude.cmd".to_string()
 }
 
-fn resolve_windows_codex_path() -> String {
-    for name in &["codex.cmd", "codex.ps1", "codex.exe", "codex"] {
-        if Command::new(name)
-            .arg("--version")
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok()
-        {
-            return name.to_string();
+fn resolve_windows_codex_path() -> std::io::Result<PathBuf> {
+    let directories = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .unwrap_or_default();
+    codex_cli_in_directories(&directories)
+}
+
+/// Put the path in the child environment: CMD expands this once, so literal `%`
+/// characters in the expanded value (including `%NAME%`) are not re-expanded.
+fn cmd_script_command(args: &[&str], mode: &str) -> String {
+    let mut command = "\"%CODEX_CLI_SCRIPT_PATH%\"".to_string();
+    for arg in args {
+        command.push(' ');
+        command.push_str(arg);
+    }
+    // raw_arg is intentional: Rust's normal Windows quoting escapes embedded
+    // quotes for argv parsing, which CMD does not use when parsing /c or /k.
+    format!(" /d /v:off /s {mode} \"{command}\"")
+}
+
+fn configure_cmd_script(command: &mut Command, path: &Path, args: &[&str], mode: &str) {
+    command
+        .raw_arg(cmd_script_command(args, mode))
+        .env("CODEX_CLI_SCRIPT_PATH", path);
+}
+
+fn codex_cli_in_directories(directories: &[PathBuf]) -> std::io::Result<PathBuf> {
+    // Use native Unicode paths rather than decoding `where.exe` output, whose
+    // console code page need not be UTF-8 (notably for npm paths under usernames).
+    find_codex_cli(|name| {
+        directories
+            .iter()
+            .map(|directory| directory.join(name))
+            .find(|path| path.is_file())
+    })
+}
+
+fn find_codex_cli(mut find: impl FnMut(&str) -> Option<PathBuf>) -> std::io::Result<PathBuf> {
+    for name in [
+        "codex.cmd",
+        "codex.ps1",
+        "codex.exe",
+        "codex.bat",
+        "codex.com",
+        "codex",
+    ] {
+        if let Some(path) = find(name) {
+            return Ok(path);
         }
     }
 
-    for name in &["codex.cmd", "codex.ps1", "codex.exe", "codex"] {
-        if let Ok(output) = Command::new("where.exe")
-            .arg(name)
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-        {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(first_line) = stdout.lines().next() {
-                    let path = first_line.trim().to_string();
-                    if !path.is_empty() {
-                        return path;
-                    }
-                }
-            }
-        }
-    }
-
-    "codex.cmd".to_string()
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "Codex CLI was not found",
+    ))
 }
 
 fn build_agent() -> Result<ureq::Agent, PollError> {
@@ -1500,6 +1553,24 @@ fn read_codex_credentials(account: &CodexAccount) -> Option<CodexTokenData> {
     auth.tokens.filter(|tokens| !tokens.access_token.is_empty())
 }
 
+/// Quota identity from local credentials, never the display email. Keep the
+/// subject when available so different members of one workspace remain distinct.
+pub fn codex_account_identity(account: &CodexAccount) -> Option<(String, Option<String>)> {
+    let content = std::fs::read_to_string(codex_auth_path_for(account)?).ok()?;
+    let file: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let tokens = file.get("tokens")?;
+    let account_id = tokens.get("account_id")?.as_str()?.trim();
+    if account_id.is_empty() {
+        return None;
+    }
+    let subject = tokens
+        .get("id_token")
+        .and_then(|token| token.as_str())
+        .and_then(|token| id_token_claim(token, "sub"))
+        .filter(|subject| !subject.is_empty());
+    Some((account_id.to_string(), subject))
+}
+
 /// Display label for a login, read from the id token already stored in
 /// `auth.json`. The CLI cannot be asked without a terminal, so this is the only
 /// non-interactive source of an account name. Returns None when the file or the
@@ -1950,6 +2021,88 @@ fn time_until_display_change_from_secs(total_secs: u64) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_codex_cli_is_a_resolution_error_not_a_fake_script_path() {
+        let error = find_codex_cli(|_| None).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        let mut searched = Vec::new();
+        let path = find_codex_cli(|name| {
+            searched.push(name.to_string());
+            (name == "codex.exe").then(|| PathBuf::from(r"C:\Program Files\Codex\codex.exe"))
+        })
+        .unwrap();
+        assert_eq!(path, PathBuf::from(r"C:\Program Files\Codex\codex.exe"));
+        assert_eq!(searched, ["codex.cmd", "codex.ps1", "codex.exe"]);
+    }
+
+    #[test]
+    fn stale_polls_cannot_refresh_deleted_or_replaced_profile_credentials() {
+        let home = std::env::var_os("LOCALAPPDATA")
+            .map(|base| PathBuf::from(base).join("Temp").join("opencode"))
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!(
+                "codex-refresh-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        let account = CodexAccount::profile("test", home.clone());
+        assert!(!codex_refresh_is_current(&account, "old-token"));
+        assert!(!home.exists());
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("auth.json"),
+            r#"{"tokens":{"access_token":"new-token","account_id":"new-account"}}"#,
+        )
+        .unwrap();
+        assert!(!codex_refresh_is_current(&account, "old-token"));
+        assert!(codex_refresh_is_current(&account, "new-token"));
+        std::fs::remove_dir_all(&home).unwrap();
+        assert!(!codex_refresh_is_current(&account, "new-token"));
+        assert!(!home.exists());
+    }
+
+    #[test]
+    fn codex_cli_discovery_preserves_unicode_installation_paths() {
+        let root = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("Temp")
+            .join("opencode")
+            .join(format!("codex-cli-{}", std::process::id()));
+        let directory = root.join("安装😀 O’Brien");
+        std::fs::create_dir_all(&directory).unwrap();
+        let executable = directory.join("codex.cmd");
+        std::fs::write(&executable, "test-only discovery fixture").unwrap();
+        assert_eq!(codex_cli_in_directories(&[directory]).unwrap(), executable);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cmd_script_invocation_handles_literal_percent_in_install_path() {
+        let root = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("Temp/opencode/cmd-script-%NAME%-test")
+            .join(format!("{} & tools", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let script = root.join("codex.cmd");
+        let output = root.join("result.txt");
+        std::fs::write(
+            &script,
+            "@echo off\r\necho %* > \"%CODEX_TEST_OUTPUT%\"\r\n",
+        )
+        .unwrap();
+        let mut command = Command::new("cmd.exe");
+        configure_cmd_script(&mut command, &script, &["hello"], "/c");
+        let status = command.env("CODEX_TEST_OUTPUT", &output).status().unwrap();
+        assert!(status.success());
+        assert_eq!(std::fs::read_to_string(output).unwrap().trim(), "hello");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn credential_signature_detects_same_length_rewrites_within_one_second() {
