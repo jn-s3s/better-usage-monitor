@@ -3,6 +3,7 @@ use super::Strings;
 pub(super) const UPDATE_VIA_WINGET_LABEL: &str = "透過 WinGet 更新";
 
 pub(super) const STRINGS: Strings = Strings {
+    codex_accounts: super::english::STRINGS.codex_accounts,
     window_title: "Codex Usage",
     refresh: "重新整理",
     update_frequency: "更新頻率",

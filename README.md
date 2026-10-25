@@ -127,7 +127,7 @@ The widget shows one Codex login at a time. Right-click the widget or the tray i
 What the multi-account view gives you:
 
 - The taskbar bars, the widget column, and the tray summary use the selected login
-- Every configured login is polled and listed in the Codex column tooltip and in the tray summary, so a second account is visible without widening the widget
+- Every configured login is polled and listed in the Codex column tooltip; the tray summary uses Windows' length-limited tooltip and may truncate when several accounts or services are shown
 - Quota alerts follow the selected login: only the login the widget displays raises a low-quota balloon, so an account you are not looking at stays quiet
 
 The browser decides which account gets authorized, because the app only runs the Codex CLI. Sign in with the account you want to monitor. Your default login is always the first entry and is never removed; once another login is configured it is listed under its own account email with a `(main)` marker, falling back to `Codex (main)` when its credentials hold no email. A single-login install keeps showing only `Codex`.

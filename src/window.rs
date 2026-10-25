@@ -189,8 +189,7 @@ enum CodexLoginStart {
     Limit,
 }
 
-/// Tray balloon text for the add/remove account flow. Kept inline rather than in
-/// the locale files because it belongs to the Codex-only account menu.
+/// Tray balloon events for the add/remove account flow.
 enum CodexLoginNotice<'a> {
     Started { folder: &'a str },
     Added { label: &'a str },
@@ -202,116 +201,46 @@ enum CodexLoginNotice<'a> {
 }
 
 fn codex_login_notice(language: LanguageId, notice: CodexLoginNotice) -> (String, String) {
-    let chinese = language == LanguageId::SimplifiedChinese;
-    match notice {
+    let strings = language.strings().codex_accounts;
+    let (title, body) = match notice {
         CodexLoginNotice::Started { folder } => {
-            if chinese {
-                (
-                    "Codex 账号".to_string(),
-                    format!("已打开登录窗口，请在浏览器中完成登录。正在等待 {folder} 的凭据。"),
-                )
-            } else {
-                (
-                    "Codex account".to_string(),
-                    format!(
-                        "Complete the sign-in in the window that just opened. Waiting for {folder}."
-                    ),
-                )
-            }
+            (strings.title, strings.started.replace("{folder}", folder))
         }
         CodexLoginNotice::Cancelled { folder } => {
-            if chinese {
-                (
-                    "Codex 账号".to_string(),
-                    format!("已停止等待 {folder} 的凭据。Codex 窗口可能仍开着，可以自行关闭。"),
-                )
-            } else {
-                (
-                    "Codex account".to_string(),
-                    format!(
-                        "Stopped waiting for {folder}. The Codex window may still be open and can be closed."
-                    ),
-                )
-            }
+            (strings.title, strings.cancelled.replace("{folder}", folder))
         }
         CodexLoginNotice::Added { label } => {
-            if chinese {
-                (
-                    "Codex 账号已添加".to_string(),
-                    format!("组件现在显示 {label}，可以随时在 Codex 账号菜单中切换。"),
-                )
-            } else {
-                (
-                    "Codex account added".to_string(),
-                    format!(
-                        "The widget now shows {label}. Switch logins from the Codex accounts menu."
-                    ),
-                )
-            }
+            (strings.added_title, strings.added.replace("{label}", label))
         }
-        CodexLoginNotice::TimedOut { path } => {
-            if chinese {
-                (
-                    "Codex 登录未完成".to_string(),
-                    format!("5 分钟内没有出现凭据，未添加账号。配置目录：{path}"),
-                )
-            } else {
-                (
-                    "Codex sign-in not finished".to_string(),
-                    format!(
-                        "No credentials appeared within 5 minutes, so nothing was added. Profile folder: {path}"
-                    ),
-                )
-            }
-        }
-        CodexLoginNotice::Failed { path } => {
-            if chinese {
-                (
-                    "无法启动 Codex 登录".to_string(),
-                    format!("未能启动 Codex CLI。可手动执行 `CODEX_HOME={path} codex login`，再把该目录写入设置。"),
-                )
-            } else {
-                (
-                    "Unable to start Codex sign-in".to_string(),
-                    format!(
-                        "The Codex CLI could not be started. Run `CODEX_HOME={path} codex login`, then add that folder to settings."
-                    ),
-                )
-            }
-        }
-        CodexLoginNotice::Removed { label } => {
-            if chinese {
-                (
-                    "Codex 账号已移除".to_string(),
-                    format!("不再监控 {label}，其配置目录保持原样。"),
-                )
-            } else {
-                (
-                    "Codex account removed".to_string(),
-                    format!(
-                        "{label} is no longer monitored. Its profile folder was left untouched."
-                    ),
-                )
-            }
-        }
-        CodexLoginNotice::Limit => {
-            if chinese {
-                (
-                    "Codex 账号已达上限".to_string(),
-                    format!(
-                        "最多只能监控 {MAX_CODEX_ACCOUNT_MENU_ITEMS} 个 Codex 登录（含默认登录）。请先移除一个账号再添加。"
-                    ),
-                )
-            } else {
-                (
-                    "Codex account limit reached".to_string(),
-                    format!(
-                        "At most {MAX_CODEX_ACCOUNT_MENU_ITEMS} Codex logins (including the default) can be monitored. Remove an account before adding another."
-                    ),
-                )
-            }
-        }
-    }
+        CodexLoginNotice::TimedOut { path } => (
+            strings.timed_out_title,
+            strings.timed_out.replace("{path}", path),
+        ),
+        CodexLoginNotice::Failed { path } => (
+            strings.failed_title,
+            strings.failed.replace("{path}", &powershell_path(path)),
+        ),
+        CodexLoginNotice::Removed { label } => (
+            strings.removed_title,
+            strings.removed.replace("{label}", label),
+        ),
+        CodexLoginNotice::Limit => (
+            strings.limit_title,
+            strings
+                .limit
+                .replace("{limit}", &MAX_CODEX_ACCOUNT_MENU_ITEMS.to_string()),
+        ),
+    };
+    (title.to_string(), body)
+}
+
+/// Escape a path embedded in a PowerShell single-quoted string.
+fn powershell_path(path: &str) -> String {
+    path.replace('\'', "''")
+        .replace('‘', "‘‘")
+        .replace('’', "’’")
+        .replace('‚', "‚‚")
+        .replace('‛', "‛‛")
 }
 
 /// First `.codex-account<N>` directory that is free. `taken` stands in for the
@@ -1059,11 +988,7 @@ fn refresh_derived_codex_label(login: &mut CodexLogin, language: LanguageId) {
 /// Marks the default login, e.g. `ray@example.com (main)`, so it stays
 /// identifiable next to the extra logins.
 fn codex_main_label(label: &str, language: LanguageId) -> String {
-    if language == LanguageId::SimplifiedChinese {
-        format!("{label}（主账号）")
-    } else {
-        format!("{label} (main)")
-    }
+    format!("{label}{}", language.strings().codex_accounts.main_suffix)
 }
 
 /// Auth-expiry balloon title. Extra logins name themselves, so the user knows
@@ -1080,7 +1005,10 @@ fn codex_auth_notice_body(strings: Strings, account: &poller::CodexAccount) -> S
     if account.is_default() {
         strings.codex_token_expired_body.to_string()
     } else if let Some(home) = account.home.as_deref() {
-        format!("Set CODEX_HOME=\"{}\" and run 'codex login' to re-authenticate this profile, then refresh this app.", home.display())
+        strings
+            .codex_accounts
+            .reauthenticate
+            .replace("{path}", &powershell_path(&home.display().to_string()))
     } else {
         strings.codex_token_expired_body.to_string()
     }
@@ -4928,19 +4856,13 @@ fn show_context_menu(hwnd: HWND) {
                 );
             }
             let _ = AppendMenuW(accounts_menu, MF_SEPARATOR, 0, PCWSTR::null());
-            let chinese = language == LanguageId::SimplifiedChinese;
+            let account_strings = language.strings().codex_accounts;
             // While a sign-in is running the same item stops waiting for it, so a
             // failed attempt never leaves the menu without a way forward.
             let add_label = native_interop::wide_str(if codex_login_pending {
-                if chinese {
-                    "取消登录"
-                } else {
-                    "Cancel sign-in"
-                }
-            } else if chinese {
-                "添加账号…"
+                account_strings.cancel
             } else {
-                "Add account…"
+                account_strings.add
             });
             let _ = AppendMenuW(
                 accounts_menu,
@@ -4950,14 +4872,9 @@ fn show_context_menu(hwnd: HWND) {
             );
             if codex_active_account > 0 {
                 if let Some(active) = codex_account_labels.get(codex_active_account) {
-                    let remove_label = native_interop::wide_str(&menu_text(&format!(
-                        "{}{active}",
-                        if chinese {
-                            "移除账号："
-                        } else {
-                            "Remove account: "
-                        }
-                    )));
+                    let remove_label = native_interop::wide_str(&menu_text(
+                        &account_strings.remove.replace("{label}", active),
+                    ));
                     let _ = AppendMenuW(
                         accounts_menu,
                         MENU_ITEM_FLAGS(0),
@@ -4966,11 +4883,7 @@ fn show_context_menu(hwnd: HWND) {
                     );
                 }
             }
-            let accounts_label = native_interop::wide_str(if chinese {
-                "Codex 账号"
-            } else {
-                "Codex accounts"
-            });
+            let accounts_label = native_interop::wide_str(account_strings.menu);
             let _ = AppendMenuW(
                 menu,
                 MF_POPUP,
@@ -5770,6 +5683,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn powershell_path_escapes_ascii_and_typographic_apostrophes() {
+        assert_eq!(
+            powershell_path("C:\\Profiles\\O’Brien\\User‘s\\Other‚s\\Last‛s"),
+            "C:\\Profiles\\O’’Brien\\User‘‘s\\Other‚‚s\\Last‛‛s"
+        );
+        assert_eq!(
+            powershell_path("C:\\Profiles\\O'Brien"),
+            "C:\\Profiles\\O''Brien"
+        );
+    }
+
+    #[test]
     fn unavailable_quota_has_no_bar_fill() {
         assert_eq!(usage_bar_fill_percentage(100.0, "--"), 0.0);
         assert_eq!(usage_bar_fill_percentage(61.0, "剩余61%"), 61.0);
@@ -6459,5 +6384,81 @@ mod tests {
             codex_account_line(&failed, true, true),
             "work: 5h ACCT | 7d ACCT"
         );
+    }
+
+    #[test]
+    fn codex_account_notices_use_locale_templates_and_preserve_values() {
+        for language in LanguageId::ALL {
+            let strings = language.strings().codex_accounts;
+            let cases = [
+                (
+                    CodexLoginNotice::Started {
+                        folder: "profile-2",
+                    },
+                    strings.title,
+                    "profile-2",
+                ),
+                (
+                    CodexLoginNotice::Cancelled {
+                        folder: "profile-2",
+                    },
+                    strings.title,
+                    "profile-2",
+                ),
+                (
+                    CodexLoginNotice::Added {
+                        label: "work {path}",
+                    },
+                    strings.added_title,
+                    "work {path}",
+                ),
+                (
+                    CodexLoginNotice::TimedOut {
+                        path: r"C:\Profiles\work",
+                    },
+                    strings.timed_out_title,
+                    r"C:\Profiles\work",
+                ),
+                (
+                    CodexLoginNotice::Failed {
+                        path: r"C:\Profiles\work",
+                    },
+                    strings.failed_title,
+                    r"C:\Profiles\work",
+                ),
+                (
+                    CodexLoginNotice::Removed { label: "work" },
+                    strings.removed_title,
+                    "work",
+                ),
+                (CodexLoginNotice::Limit, strings.limit_title, "39"),
+            ];
+            for (notice, expected_title, value) in cases {
+                let (title, body) = codex_login_notice(language, notice);
+                assert_eq!(title, expected_title);
+                assert!(body.contains(value), "{language:?}: {body}");
+            }
+        }
+    }
+
+    #[test]
+    fn codex_profile_reauthentication_is_localized_and_powershell_escaped() {
+        let account =
+            poller::CodexAccount::profile("work", PathBuf::from(r"C:\Users\O'Brien\codex work"));
+        for language in LanguageId::ALL {
+            let body = codex_auth_notice_body(language.strings(), &account);
+            assert!(
+                body.contains("$env:CODEX_HOME = 'C:\\Users\\O''Brien\\codex work'; codex login")
+            );
+            assert!(!body.contains("{path}"));
+        }
+        let (title, body) = codex_login_notice(
+            LanguageId::SimplifiedChinese,
+            CodexLoginNotice::Failed {
+                path: r"C:\Users\O'Brien\codex work",
+            },
+        );
+        assert_eq!(title, "无法启动 Codex 登录");
+        assert!(body.contains("O''Brien"));
     }
 }

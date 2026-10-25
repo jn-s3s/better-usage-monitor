@@ -3,6 +3,27 @@ use super::Strings;
 pub(super) const UPDATE_VIA_WINGET_LABEL: &str = "Update via WinGet";
 
 pub(super) const STRINGS: Strings = Strings {
+    codex_accounts: super::CodexAccountStrings {
+        menu: "Codex accounts",
+        add: "Add account…",
+        cancel: "Cancel sign-in",
+        remove: "Remove account: {label}",
+        main_suffix: " (main)",
+        title: "Codex account",
+        started: "Complete the sign-in in the window that just opened. Waiting for {folder}.",
+        cancelled: "Stopped waiting for {folder}. The Codex window may still be open and can be closed.",
+        added_title: "Codex account added",
+        added: "The widget now shows {label}. Switch logins from the Codex accounts menu.",
+        timed_out_title: "Codex sign-in not finished",
+        timed_out: "No credentials appeared within 5 minutes, so nothing was added. Profile folder: {path}",
+        failed_title: "Unable to start Codex sign-in",
+        failed: "The Codex CLI could not be started. In PowerShell, run $env:CODEX_HOME = '{path}'; codex login, then add that folder to settings.",
+        removed_title: "Codex account removed",
+        removed: "{label} is no longer monitored. Its profile folder was left untouched.",
+        limit_title: "Codex account limit reached",
+        limit: "At most {limit} Codex logins (including the default) can be monitored. Remove an account before adding another.",
+        reauthenticate: "In PowerShell, run $env:CODEX_HOME = '{path}'; codex login to re-authenticate this profile, then refresh this app.",
+    },
     window_title: "Codex Usage",
     refresh: "Refresh",
     update_frequency: "Update Frequency",

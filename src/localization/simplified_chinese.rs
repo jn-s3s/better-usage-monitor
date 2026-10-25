@@ -3,6 +3,27 @@ use super::Strings;
 pub(super) const UPDATE_VIA_WINGET_LABEL: &str = "通过 WinGet 更新";
 
 pub(super) const STRINGS: Strings = Strings {
+    codex_accounts: super::CodexAccountStrings {
+        menu: "Codex 账号",
+        add: "添加账号…",
+        cancel: "取消登录",
+        remove: "移除账号：{label}",
+        main_suffix: "（主账号）",
+        title: "Codex 账号",
+        started: "已打开登录窗口，请在浏览器中完成登录。正在等待 {folder} 的凭据。",
+        cancelled: "已停止等待 {folder} 的凭据。Codex 窗口可能仍开着，可以自行关闭。",
+        added_title: "Codex 账号已添加",
+        added: "组件现在显示 {label}，可以随时在 Codex 账号菜单中切换。",
+        timed_out_title: "Codex 登录未完成",
+        timed_out: "5 分钟内没有出现凭据，未添加账号。配置目录：{path}",
+        failed_title: "无法启动 Codex 登录",
+        failed: "未能启动 Codex CLI。请在 PowerShell 中运行 $env:CODEX_HOME = '{path}'; codex login，再把该目录写入设置。",
+        removed_title: "Codex 账号已移除",
+        removed: "不再监控 {label}，其配置目录保持原样。",
+        limit_title: "Codex 账号已达上限",
+        limit: "最多只能监控 {limit} 个 Codex 登录（含默认登录）。请先移除一个账号再添加。",
+        reauthenticate: "请在 PowerShell 中运行 $env:CODEX_HOME = '{path}'; codex login 以重新登录此账号，然后刷新本工具。",
+    },
     window_title: "Codex Usage",
     refresh: "立即刷新",
     update_frequency: "刷新频率",
