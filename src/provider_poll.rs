@@ -1,9 +1,12 @@
 //! Per-provider freshness, retry deadlines and selection-safe request completion.
 use crate::models::{AppUsageData, UsageData};
-use crate::poller::{CredentialWatchMode, CredentialWatchSnapshot, PollError};
+use crate::poller::{CredentialWatchMode, CredentialWatchSnapshot, PollError, ProviderSpec};
 use crate::quota_refresh::{self, History, ResetRefresh};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
+
+static NEXT_MONITOR_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 pub struct Service {
     pub data: Option<UsageData>,
@@ -24,6 +27,9 @@ pub struct Service {
 #[derive(Clone)]
 pub struct Job {
     pub id: usize,
+    /// Provider (and, for Codex, login) this slot polls.
+    pub spec: ProviderSpec,
+    epoch: u64,
     generation: u64,
     ticket: u64,
     forced: bool,
@@ -39,7 +45,22 @@ pub struct Completion {
     pub successful: bool,
 }
 pub struct Monitor {
-    pub services: [Service; 3],
+    pub services: Vec<Service>,
+    /// One spec per service, in service order. Slots 0-2 stay
+    /// Claude/Codex/Antigravity; extra Codex logins follow.
+    specs: Vec<ProviderSpec>,
+    epoch: u64,
+}
+
+/// Whether two slots poll the same provider and login. Display labels are left
+/// out, so renaming a login does not look like a slot change.
+fn same_target(left: &ProviderSpec, right: &ProviderSpec) -> bool {
+    match (left, right) {
+        (ProviderSpec::Claude, ProviderSpec::Claude)
+        | (ProviderSpec::Antigravity, ProviderSpec::Antigravity) => true,
+        (ProviderSpec::Codex(a), ProviderSpec::Codex(b)) => a.key == b.key,
+        _ => false,
+    }
 }
 
 fn is_auth(error: PollError) -> bool {
@@ -48,16 +69,22 @@ fn is_auth(error: PollError) -> bool {
         PollError::AuthRequired | PollError::TokenExpired | PollError::NoCredentials
     )
 }
-fn watch_mode(id: usize, error: PollError) -> CredentialWatchMode {
-    if id == 1 {
-        return CredentialWatchMode::Codex;
-    }
-    if id == 2 {
-        CredentialWatchMode::Antigravity
-    } else if error == PollError::NoCredentials {
-        CredentialWatchMode::AllSources
-    } else {
-        CredentialWatchMode::ActiveSource
+
+/// Which credentials file a failing slot should watch for changes.
+fn watch_mode(spec: &ProviderSpec, error: PollError) -> CredentialWatchMode {
+    match spec {
+        ProviderSpec::Codex(account) => match &account.home {
+            Some(home) => CredentialWatchMode::CodexProfile(home.clone()),
+            None => CredentialWatchMode::Codex,
+        },
+        ProviderSpec::Antigravity => CredentialWatchMode::Antigravity,
+        ProviderSpec::Claude => {
+            if error == PollError::NoCredentials {
+                CredentialWatchMode::AllSources
+            } else {
+                CredentialWatchMode::ActiveSource
+            }
+        }
     }
 }
 
@@ -80,11 +107,11 @@ pub fn execute(
 ) -> Attempt {
     if !job.forced {
         if let Some((mode, old)) = &job.auth {
-            let current = credentials(*mode);
+            let current = credentials(mode.clone());
             if current == *old {
                 return Attempt {
                     result: None,
-                    auth: Some((*mode, current)),
+                    auth: Some((mode.clone(), current)),
                 };
             }
         }
@@ -96,8 +123,8 @@ pub fn execute(
         .copied()
         .filter(|e| is_auth(*e))
         .map(|error| {
-            let mode = watch_mode(job.id, error);
-            (mode, credentials(mode))
+            let mode = watch_mode(&job.spec, error);
+            (mode.clone(), credentials(mode))
         });
     Attempt {
         result: Some(result),
@@ -137,14 +164,19 @@ pub fn launch(
 }
 
 impl Monitor {
-    pub fn new(enabled: [bool; 3], now: Instant) -> Self {
-        Self {
-            services: std::array::from_fn(|id| Service {
+    /// Build the service slots for `specs`, each enabled by the matching flag.
+    /// A length mismatch leaves the extra flags/services out rather than
+    /// panicking, because specs and flags are derived from the same settings.
+    pub fn with_specs(specs: Vec<ProviderSpec>, enabled: Vec<bool>, now: Instant) -> Self {
+        let services = specs
+            .iter()
+            .enumerate()
+            .map(|(id, _)| Service {
                 data: None,
                 history: History::default(),
                 error: None,
                 interval_ms: 900_000,
-                enabled: enabled[id],
+                enabled: enabled.get(id).copied().unwrap_or(false),
                 generation: 0,
                 in_flight: None,
                 next_ticket: 0,
@@ -154,10 +186,91 @@ impl Monitor {
                 retry_not_before: None,
                 auth: None,
                 reset: ResetRefresh::default(),
-            }),
+            })
+            .collect();
+        Self {
+            services,
+            specs,
+            epoch: NEXT_MONITOR_EPOCH.fetch_add(1, Ordering::Relaxed),
         }
     }
-    pub fn configure(&mut self, enabled: [bool; 3], now: Instant) {
+
+    /// The provider/login each service slot polls, in slot order.
+    pub fn specs(&self) -> &[ProviderSpec] {
+        &self.specs
+    }
+
+    /// Whether the current slots already poll the same providers and logins as
+    /// `specs`, so the caller can keep cached numbers instead of rebuilding the
+    /// monitor. Display labels are ignored: a rename must not discard cached usage.
+    pub fn matches_specs(&self, specs: &[ProviderSpec]) -> bool {
+        self.specs.len() == specs.len()
+            && self
+                .specs
+                .iter()
+                .zip(specs)
+                .all(|(current, wanted)| same_target(current, wanted))
+    }
+
+    /// Adopt new display labels without touching the service slots or the numbers
+    /// they hold. Callers confirm `matches_specs` first, so the slots still line
+    /// up with the new specs.
+    pub fn relabel(&mut self, specs: &[ProviderSpec]) {
+        self.specs = specs.to_vec();
+    }
+
+    /// Replace the slots while keeping state for providers whose target did not
+    /// change. A new epoch makes every worker from the previous layout stale.
+    pub fn replace_specs(&mut self, specs: Vec<ProviderSpec>, enabled: Vec<bool>, now: Instant) {
+        let mut previous: Vec<Option<(ProviderSpec, Service)>> = self
+            .specs
+            .drain(..)
+            .zip(self.services.drain(..))
+            .map(|(spec, service)| Some((spec, service)))
+            .collect();
+        let mut services = Vec::with_capacity(specs.len());
+        for (index, spec) in specs.iter().enumerate() {
+            let preserved = previous
+                .iter_mut()
+                .find(|entry| {
+                    entry
+                        .as_ref()
+                        .is_some_and(|(old_spec, _)| same_target(old_spec, spec))
+                })
+                .and_then(Option::take)
+                .map(|(_, mut service)| {
+                    service.enabled = enabled.get(index).copied().unwrap_or(false);
+                    if service.in_flight.is_none() {
+                        service.due = service
+                            .retry_not_before
+                            .map_or(now, |deadline| deadline.max(now));
+                    }
+                    service.forced = service.enabled;
+                    service
+                });
+            services.push(preserved.unwrap_or_else(|| Service {
+                data: None,
+                history: History::default(),
+                error: None,
+                interval_ms: 900_000,
+                enabled: enabled.get(index).copied().unwrap_or(false),
+                generation: 0,
+                in_flight: None,
+                next_ticket: 0,
+                forced: false,
+                retries: 0,
+                due: now,
+                retry_not_before: None,
+                auth: None,
+                reset: ResetRefresh::default(),
+            }));
+        }
+        self.specs = specs;
+        self.services = services;
+        self.epoch = NEXT_MONITOR_EPOCH.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn configure(&mut self, enabled: impl IntoIterator<Item = bool>, now: Instant) {
         for (service, enabled) in self.services.iter_mut().zip(enabled) {
             if service.enabled != enabled {
                 service.enabled = enabled;
@@ -178,10 +291,15 @@ impl Monitor {
         }
     }
     pub fn plan(&mut self, now: Instant) -> Vec<Job> {
+        // Zip instead of indexing: slots and specs are one-to-one, but a slot
+        // without a spec must yield no job rather than an out-of-bounds panic.
+        let specs = &self.specs;
+        let epoch = self.epoch;
         self.services
             .iter_mut()
+            .zip(specs)
             .enumerate()
-            .filter_map(|(id, s)| {
+            .filter_map(|(id, (s, spec))| {
                 if !s.enabled || s.in_flight.is_some() || s.due > now {
                     return None;
                 }
@@ -190,6 +308,8 @@ impl Monitor {
                 let forced = std::mem::take(&mut s.forced);
                 Some(Job {
                     id,
+                    spec: spec.clone(),
+                    epoch,
                     generation: s.generation,
                     ticket: s.next_ticket,
                     forced,
@@ -207,7 +327,38 @@ impl Monitor {
         base: u32,
         adaptive: bool,
     ) -> Completion {
-        let s = &mut self.services[job.id];
+        if job.epoch != self.epoch {
+            if let Some(index) = self
+                .specs
+                .iter()
+                .position(|spec| same_target(spec, &job.spec))
+            {
+                let service = &mut self.services[index];
+                if service.in_flight == Some(job.ticket) {
+                    service.in_flight = None;
+                    if let Some(Err(PollError::RateLimited(Some(ms)))) = attempt.result {
+                        let deadline = now + Duration::from_millis(ms as u64);
+                        service.retry_not_before = Some(deadline);
+                        service.due = service.due.max(deadline);
+                    }
+                }
+            }
+            return Completion {
+                accepted: false,
+                successful: false,
+                notify_auth: false,
+            };
+        }
+        // An account removal can rebuild a shorter monitor while a query for this
+        // slot is still in flight, so the slot may no longer exist. A job without
+        // a slot is stale and falls through to the "not accepted" path.
+        let Some(s) = self.services.get_mut(job.id) else {
+            return Completion {
+                accepted: false,
+                successful: false,
+                notify_auth: false,
+            };
+        };
         let owns_request = s.in_flight == Some(job.ticket);
         if owns_request {
             s.in_flight = None;
@@ -312,12 +463,14 @@ impl Monitor {
             .min()
             .unwrap_or(base)
     }
+    /// Slot order is fixed: 0 Claude, 1 the active Codex login, 2 Antigravity,
+    /// 3+ the remaining Codex logins.
     pub fn cached(&self) -> AppUsageData {
         let get = |id: usize| {
-            self.services[id]
-                .enabled
-                .then(|| self.services[id].data.clone())
-                .flatten()
+            self.services
+                .get(id)
+                .filter(|service| service.enabled)
+                .and_then(|service| service.data.clone())
         };
         AppUsageData {
             claude_code: get(0),
@@ -376,9 +529,12 @@ impl Service {
                     PollError::TokenExpired => "登录已过期",
                     PollError::NetworkUnavailable => "网络连接失败",
                     PollError::RateLimited(_) => "请求过于频繁，正在退避",
+                    PollError::AccountMismatch => "返回的账号与配置的账号不一致",
                     PollError::ServerError => "服务暂时不可用",
                     PollError::RequestFailed => "无法读取额度响应",
                 }
+            } else if error == PollError::AccountMismatch {
+                "the returned account does not match this saved profile"
             } else {
                 error.category()
             };
@@ -406,13 +562,28 @@ impl Service {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::poller::CodexAccount;
+    use std::path::PathBuf;
     use std::sync::{mpsc, Mutex};
+
+    /// The fixed Claude/Codex/Antigravity triple used by most tests.
+    fn test_monitor(enabled: [bool; 3], now: Instant) -> Monitor {
+        Monitor::with_specs(
+            vec![
+                ProviderSpec::Claude,
+                ProviderSpec::default_codex("Codex"),
+                ProviderSpec::Antigravity,
+            ],
+            enabled.to_vec(),
+            now,
+        )
+    }
 
     #[test]
     fn server_retry_deadline_survives_manual_refresh_and_selection_changes() {
         let now = Instant::now();
         let wall = SystemTime::now();
-        let mut monitor = Monitor::new([true, true, false], now);
+        let mut monitor = test_monitor([true, true, false], now);
         let jobs = monitor.plan(now);
         monitor.force(now, true); // A click during the request must also wait.
         complete(
@@ -465,7 +636,7 @@ mod tests {
     fn hover_status_tracks_running_requests_schedules_and_auth_checks() {
         let now = Instant::now();
         let wall = SystemTime::now();
-        let mut monitor = Monitor::new([true, false, false], now);
+        let mut monitor = test_monitor([true, false, false], now);
         let job = monitor.plan(now).remove(0);
         assert!(monitor.services[0]
             .description(wall, now, true)
@@ -500,7 +671,7 @@ mod tests {
     #[test]
     fn codex_publishes_while_claude_is_still_waiting() {
         let now = Instant::now();
-        let mut monitor = Monitor::new([true, true, false], now);
+        let mut monitor = test_monitor([true, true, false], now);
         let jobs = monitor.plan(now);
         let (release, wait) = mpsc::channel();
         let wait = Mutex::new(wait);
@@ -528,10 +699,255 @@ mod tests {
     }
 
     #[test]
+    fn extra_codex_logins_get_their_own_slots_and_credentials_watch() {
+        let now = Instant::now();
+        let work = ProviderSpec::Codex(CodexAccount::profile(
+            "work",
+            PathBuf::from(r"C:\Users\Ray\.codex-work"),
+        ));
+        let side = ProviderSpec::Codex(CodexAccount::profile(
+            "side",
+            PathBuf::from(r"C:\Users\Ray\.codex-side"),
+        ));
+        let mut monitor = Monitor::with_specs(
+            vec![
+                ProviderSpec::Claude,
+                work.clone(),
+                ProviderSpec::Antigravity,
+                side.clone(),
+                ProviderSpec::default_codex("Codex"),
+            ],
+            vec![true; 5],
+            now,
+        );
+
+        let jobs = monitor.plan(now);
+        assert_eq!(jobs.len(), 5);
+        // Slot 1 carries the login the widget shows; the rest follow.
+        assert_eq!(jobs[1].spec, work);
+        assert_eq!(jobs[3].spec, side);
+        assert!(jobs[4].spec.codex_account().unwrap().is_default());
+
+        // Each login watches its own credentials file, so re-authenticating one
+        // profile only re-triggers that profile.
+        assert_eq!(
+            watch_mode(&work, PollError::AuthRequired),
+            CredentialWatchMode::CodexProfile(PathBuf::from(r"C:\Users\Ray\.codex-work"))
+        );
+        assert_eq!(
+            watch_mode(&work, PollError::NoCredentials),
+            CredentialWatchMode::CodexProfile(PathBuf::from(r"C:\Users\Ray\.codex-work"))
+        );
+        assert_eq!(
+            watch_mode(
+                &ProviderSpec::default_codex("Codex"),
+                PollError::AuthRequired
+            ),
+            CredentialWatchMode::Codex
+        );
+        // A missing Claude installation still watches every known source.
+        assert_eq!(
+            watch_mode(&ProviderSpec::Claude, PollError::NoCredentials),
+            CredentialWatchMode::AllSources
+        );
+
+        // The widget-facing cache keeps slot 1 and hiding Codex hides every
+        // Codex slot, not just the displayed one.
+        monitor.configure(vec![false, false, false, false, false], now);
+        assert!(monitor.cached().codex.is_none());
+        assert!(monitor.plan(now + Duration::from_secs(3600)).is_empty());
+    }
+
+    #[test]
+    fn cached_codex_stays_the_active_login_and_other_logins_do_not_leak_in() {
+        let now = Instant::now();
+        let wall = SystemTime::now();
+        let work = ProviderSpec::Codex(CodexAccount::profile(
+            "work",
+            PathBuf::from(r"C:\Users\Ray\.codex-work"),
+        ));
+        let mut monitor = Monitor::with_specs(
+            vec![
+                ProviderSpec::Claude,
+                work.clone(),
+                ProviderSpec::Antigravity,
+                ProviderSpec::default_codex("Codex"),
+            ],
+            vec![true; 4],
+            now,
+        );
+
+        let jobs = monitor.plan(now);
+        complete(&mut monitor, &jobs[1], Ok(usage(70.0)), now, wall);
+        complete(&mut monitor, &jobs[3], Ok(usage(10.0)), now, wall);
+
+        let cached = monitor.cached();
+        assert_eq!(cached.codex.unwrap().session.percentage, 70.0);
+        assert!(cached.antigravity.is_none());
+        // The default login is polled but never replaces the displayed one.
+        assert!(monitor.services[3].data.is_some());
+        assert!(monitor.services[1].data.is_some());
+    }
+
+    #[test]
+    fn plan_jobs_carry_the_spec_so_polling_knows_which_login_to_read() {
+        let now = Instant::now();
+        let work = ProviderSpec::Codex(CodexAccount::profile(
+            "work",
+            PathBuf::from(r"C:\Users\Ray\.codex-work"),
+        ));
+        let mut monitor = Monitor::with_specs(
+            vec![ProviderSpec::Claude, work.clone()],
+            vec![true, true],
+            now,
+        );
+        let jobs = monitor.plan(now);
+        assert_eq!(jobs[1].spec, work);
+        assert!(monitor.matches_specs(&[ProviderSpec::Claude, work.clone()]));
+        assert!(!monitor.matches_specs(&[ProviderSpec::Claude, ProviderSpec::Antigravity]));
+    }
+
+    #[test]
+    fn completion_from_a_previous_account_layout_cannot_claim_a_new_request() {
+        let now = Instant::now();
+        let wall = SystemTime::now();
+        let account_a =
+            ProviderSpec::Codex(CodexAccount::profile("A", PathBuf::from(r"C:\Profiles\A")));
+        let account_b =
+            ProviderSpec::Codex(CodexAccount::profile("B", PathBuf::from(r"C:\Profiles\B")));
+        let mut monitor = Monitor::with_specs(
+            vec![ProviderSpec::Claude, account_a],
+            vec![false, true],
+            now,
+        );
+        let stale = monitor.plan(now).remove(0);
+        monitor.replace_specs(
+            vec![ProviderSpec::Claude, account_b],
+            vec![false, true],
+            now,
+        );
+        let current = monitor.plan(now).remove(0);
+
+        assert_eq!(stale.id, current.id);
+        assert_eq!(stale.ticket, current.ticket);
+        assert_eq!(stale.generation, current.generation);
+        assert!(!complete(&mut monitor, &stale, Ok(usage(10.0)), now, wall).accepted);
+        assert!(monitor.services[1].in_flight.is_some());
+        assert!(complete(&mut monitor, &current, Ok(usage(80.0)), now, wall).accepted);
+        assert_eq!(monitor.cached().codex.unwrap().session.percentage, 80.0);
+    }
+
+    #[test]
+    fn replacing_account_slots_preserves_other_providers_retry_deadlines() {
+        let now = Instant::now();
+        let wall = SystemTime::now();
+        let account_a =
+            ProviderSpec::Codex(CodexAccount::profile("A", PathBuf::from(r"C:\Profiles\A")));
+        let account_b =
+            ProviderSpec::Codex(CodexAccount::profile("B", PathBuf::from(r"C:\Profiles\B")));
+        let mut monitor =
+            Monitor::with_specs(vec![ProviderSpec::Claude, account_a], vec![true, true], now);
+        let first_jobs = monitor.plan(now);
+        complete(&mut monitor, &first_jobs[0], Ok(usage(45.0)), now, wall);
+        complete(&mut monitor, &first_jobs[1], Ok(usage(30.0)), now, wall);
+        monitor.force(now, true);
+        let jobs = monitor.plan(now);
+        complete(
+            &mut monitor,
+            jobs.iter().find(|job| job.id == 0).unwrap(),
+            Err(PollError::RateLimited(Some(120_000))),
+            now,
+            wall,
+        );
+        let retry_at = monitor.services[0].retry_not_before;
+        let cached_claude = monitor.services[0]
+            .data
+            .as_ref()
+            .unwrap()
+            .session
+            .percentage;
+
+        monitor.replace_specs(
+            vec![ProviderSpec::Claude, account_b],
+            vec![true, true],
+            now + Duration::from_secs(10),
+        );
+
+        assert_eq!(monitor.services[0].retry_not_before, retry_at);
+        assert_eq!(
+            monitor.services[0].error,
+            Some(PollError::RateLimited(Some(120_000)))
+        );
+        assert_eq!(
+            monitor.services[0]
+                .data
+                .as_ref()
+                .unwrap()
+                .session
+                .percentage,
+            45.0
+        );
+        assert_eq!(
+            monitor.services[0]
+                .data
+                .as_ref()
+                .unwrap()
+                .session
+                .percentage,
+            cached_claude
+        );
+        assert!(monitor
+            .plan(now + Duration::from_secs(10))
+            .iter()
+            .all(|job| job.id != 0));
+    }
+
+    #[test]
+    fn renaming_a_login_keeps_the_slots_and_only_updates_the_labels() {
+        let now = Instant::now();
+        let work = ProviderSpec::Codex(CodexAccount::profile(
+            "work",
+            PathBuf::from(r"C:\Users\Ray\.codex-work"),
+        ));
+        let mut monitor = Monitor::with_specs(
+            vec![ProviderSpec::Claude, work.clone()],
+            vec![true, true],
+            now,
+        );
+        let renamed = ProviderSpec::Codex(CodexAccount::profile(
+            "work (main)",
+            PathBuf::from(r"C:\Users\Ray\.codex-work"),
+        ));
+        let specs = vec![ProviderSpec::Claude, renamed.clone()];
+        // Same target, different label: no rebuild, just a relabel.
+        assert!(monitor.matches_specs(&specs));
+        monitor.relabel(&specs);
+        assert_eq!(monitor.specs(), specs.as_slice());
+        // A different home is still a different login.
+        let other = ProviderSpec::Codex(CodexAccount::profile(
+            "side",
+            PathBuf::from(r"C:\Users\Ray\.codex-side"),
+        ));
+        assert!(!monitor.matches_specs(&[ProviderSpec::Claude, other]));
+    }
+
+    #[test]
+    fn plan_leaves_a_slot_without_a_spec_unplanned_instead_of_panicking() {
+        let now = Instant::now();
+        let mut monitor = test_monitor([true, true, true], now);
+        // A shorter spec list must not turn the next tick into an out-of-bounds
+        // abort; the slot without a spec simply yields no job.
+        monitor.relabel(&[ProviderSpec::Claude]);
+        let jobs = monitor.plan(now);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, 0);
+    }
+
+    #[test]
     fn fast_service_can_poll_again_while_the_other_service_is_still_in_flight() {
         let now = Instant::now();
         let wall = SystemTime::now();
-        let monitor = Arc::new(Mutex::new(Monitor::new([true, true, false], now)));
+        let monitor = Arc::new(Mutex::new(test_monitor([true, true, false], now)));
         let jobs = monitor.lock().unwrap().plan(now);
         let (release, wait) = mpsc::channel();
         let wait = Mutex::new(wait);
@@ -603,7 +1019,7 @@ mod tests {
     ) {
         let now = Instant::now();
         let wall = SystemTime::now();
-        let mut monitor = Monitor::new([false, true, false], now);
+        let mut monitor = test_monitor([false, true, false], now);
         let old = monitor.plan(now).remove(0);
         monitor.configure([true, false, false], now);
         monitor.configure([true, true, false], now);
@@ -616,6 +1032,23 @@ mod tests {
         assert!(monitor.plan(now).is_empty());
         assert!(complete(&mut monitor, &new, Ok(usage(30.0)), now, wall).accepted);
     }
+    #[test]
+    fn completion_for_a_slot_that_no_longer_exists_is_discarded() {
+        // Removing an account rebuilds a shorter monitor while a query may still
+        // be in flight; its completion must not index past the new slot list.
+        let now = Instant::now();
+        let wall = SystemTime::now();
+        let mut monitor = test_monitor([true, true, false], now);
+        let mut stale = monitor.plan(now).remove(0);
+        stale.id = 9;
+        let attempt = execute(&stale, || Ok(usage(10.0)), |_| vec![]);
+        assert!(
+            !monitor
+                .finish(&stale, attempt, now, wall, 900_000, true)
+                .accepted
+        );
+    }
+
     fn usage(used: f64) -> UsageData {
         let mut data = UsageData::default();
         data.session.percentage = used;
@@ -635,7 +1068,7 @@ mod tests {
     fn mixed_failure_retry_and_recovery_keep_independent_timestamps_and_deadlines() {
         let start = Instant::now();
         let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
-        let mut m = Monitor::new([true, true, false], start);
+        let mut m = test_monitor([true, true, false], start);
         let jobs = m.plan(start);
         complete(&mut m, &jobs[0], Ok(usage(40.0)), start, wall);
         complete(
@@ -673,7 +1106,7 @@ mod tests {
     fn switching_services_during_a_request_discards_old_completion_and_fetches_new_selection() {
         let now = Instant::now();
         let wall = SystemTime::now();
-        let mut m = Monitor::new([false, true, false], now);
+        let mut m = test_monitor([false, true, false], now);
         let old = m.plan(now).remove(0);
         m.configure([true, false, false], now);
         assert!(!complete(&mut m, &old, Ok(usage(95.0)), now, wall).accepted);
@@ -692,7 +1125,7 @@ mod tests {
     fn auth_failure_does_not_pause_other_service_and_recovers_only_after_credentials_change() {
         let now = Instant::now();
         let wall = SystemTime::now();
-        let mut m = Monitor::new([true, true, false], now);
+        let mut m = test_monitor([true, true, false], now);
         let jobs = m.plan(now);
         assert!(complete(&mut m, &jobs[0], Err(PollError::AuthRequired), now, wall).notify_auth);
         complete(&mut m, &jobs[1], Ok(usage(90.0)), now, wall);
@@ -732,7 +1165,7 @@ mod tests {
     fn failed_refresh_keeps_cached_data_and_pending_manual_request_survives_completion() {
         let now = Instant::now();
         let wall = SystemTime::now();
-        let mut m = Monitor::new([false, true, false], now);
+        let mut m = test_monitor([false, true, false], now);
         let job = m.plan(now).remove(0);
         complete(&mut m, &job, Ok(usage(55.0)), now, wall);
         m.force(now, true);
@@ -751,7 +1184,7 @@ mod tests {
     fn all_services_fail_independently_and_only_the_transient_failure_retries() {
         let now = Instant::now();
         let wall = SystemTime::now();
-        let mut m = Monitor::new([true, true, true], now);
+        let mut m = test_monitor([true, true, true], now);
         let jobs = m.plan(now);
         for (job, error) in jobs.iter().zip([
             PollError::AuthRequired,
@@ -772,7 +1205,7 @@ mod tests {
     fn network_recovery_refreshes_failed_data_without_retrying_unchanged_auth() {
         let now = Instant::now();
         let wall = SystemTime::now();
-        let mut m = Monitor::new([true, true, false], now);
+        let mut m = test_monitor([true, true, false], now);
         let jobs = m.plan(now);
         complete(&mut m, &jobs[0], Err(PollError::AuthRequired), now, wall);
         complete(
@@ -799,7 +1232,7 @@ mod tests {
     fn codex_auth_watch_uses_codex_credentials_and_manual_refresh_survives_a_recovery_event() {
         let now = Instant::now();
         let wall = SystemTime::now();
-        let mut m = Monitor::new([false, true, false], now);
+        let mut m = test_monitor([false, true, false], now);
         let job = m.plan(now).remove(0);
         let attempt = execute(
             &job,
@@ -824,7 +1257,7 @@ mod tests {
     fn upcoming_reset_is_polled_on_time_instead_of_waiting_for_the_base_interval() {
         let now = Instant::now();
         let wall = SystemTime::now();
-        let mut m = Monitor::new([false, true, false], now);
+        let mut m = test_monitor([false, true, false], now);
         let job = m.plan(now).remove(0);
         let mut data = usage(50.0);
         data.session.resets_at = Some(wall + Duration::from_secs(60));

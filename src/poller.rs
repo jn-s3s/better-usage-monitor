@@ -2,7 +2,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -24,6 +24,7 @@ const ANTIGRAVITY_ENDPOINTS: &[&str] = &[
     "https://cloudcode-pa.googleapis.com",
 ];
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+const CREATE_NEW_CONSOLE: u32 = 0x00000010;
 
 const MODEL_FALLBACK_CHAIN: &[&str] = &["claude-3-haiku-20240307", "claude-haiku-4-5-20251001"];
 
@@ -36,6 +37,9 @@ pub enum PollError {
     RateLimited(Option<u32>),
     ServerError,
     RequestFailed,
+    /// The usage endpoint answered for a different account than the one asked
+    /// for, so the numbers cannot be attributed to the requested login.
+    AccountMismatch,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,19 +58,88 @@ impl PollError {
             Self::RateLimited(_) => "rate_limited",
             Self::ServerError => "server_error",
             Self::RequestFailed => "invalid_response",
+            Self::AccountMismatch => "account_mismatch",
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CredentialWatchMode {
     ActiveSource,
     AllSources,
     Antigravity,
     Codex,
+    /// An extra Codex profile: the `auth.json` inside that profile home.
+    CodexProfile(PathBuf),
 }
 
 pub type CredentialWatchSnapshot = Vec<String>;
+
+/// Alert-dedup key of the default Codex login. Persisted settings already use
+/// this key, so it must stay stable across releases.
+pub const CODEX_DEFAULT_ACCOUNT_KEY: &str = "codex";
+
+/// One Codex login the monitor can read quota for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodexAccount {
+    /// Stable identity used for alert dedup and settings round-trips.
+    pub key: String,
+    /// Display label shown in menus and tooltips.
+    pub label: String,
+    /// `None` for the default `$CODEX_HOME` / `~/.codex` login, `Some` for an
+    /// extra profile home whose `auth.json` holds a separate login.
+    pub home: Option<PathBuf>,
+}
+
+impl CodexAccount {
+    /// The login the Codex CLI itself uses, from `$CODEX_HOME` or `~/.codex`.
+    pub fn default_account(label: impl Into<String>) -> Self {
+        Self {
+            key: CODEX_DEFAULT_ACCOUNT_KEY.to_string(),
+            label: label.into(),
+            home: None,
+        }
+    }
+
+    /// An extra profile home. The caller is responsible for passing an
+    /// absolute, non-empty path (settings normalization enforces this).
+    pub fn profile(label: impl Into<String>, home: PathBuf) -> Self {
+        let key = format!("codex:{}", home.display());
+        Self {
+            key,
+            label: label.into(),
+            home: Some(home),
+        }
+    }
+
+    /// Whether this login is the default one rather than an extra profile.
+    pub fn is_default(&self) -> bool {
+        self.home.is_none()
+    }
+}
+
+/// What a single polling slot talks to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProviderSpec {
+    Claude,
+    Codex(CodexAccount),
+    Antigravity,
+}
+
+impl ProviderSpec {
+    /// The default Codex login, labelled with the localized provider name.
+    pub fn default_codex(label: impl Into<String>) -> Self {
+        ProviderSpec::Codex(CodexAccount::default_account(label))
+    }
+
+    /// Codex account behind this slot, when the slot is a Codex slot.
+    pub fn codex_account(&self) -> Option<&CodexAccount> {
+        match self {
+            ProviderSpec::Codex(account) => Some(account),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Deserialize)]
 struct UsageResponse {
@@ -94,6 +167,9 @@ struct CodexTokenData {
 #[derive(Deserialize)]
 struct CodexUsageResponse {
     rate_limit: Option<Option<Box<CodexRateLimitDetails>>>,
+    /// Echo of the account the endpoint actually answered for.
+    #[serde(default)]
+    account_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -199,12 +275,11 @@ extern "system" {
     fn CredFree(buffer: *mut c_void);
 }
 
-pub fn poll_provider(id: usize) -> Result<UsageData, PollError> {
-    match id {
-        0 => poll_claude_code(),
-        1 => poll_codex(),
-        2 => poll_antigravity(),
-        _ => Err(PollError::RequestFailed),
+pub fn poll_provider(spec: &ProviderSpec) -> Result<UsageData, PollError> {
+    match spec {
+        ProviderSpec::Claude => poll_claude_code(),
+        ProviderSpec::Codex(account) => poll_codex(account),
+        ProviderSpec::Antigravity => poll_antigravity(),
     }
 }
 
@@ -228,21 +303,32 @@ fn poll_claude_code() -> Result<UsageData, PollError> {
     fetch_usage_with_fallback(&creds.access_token)
 }
 
-fn poll_codex() -> Result<UsageData, PollError> {
-    let creds = match read_codex_credentials() {
+/// Poll one Codex login. Extra profiles are checked strictly, because the
+/// endpoint answers a foreign `ChatGPT-Account-Id` with the token's own usage
+/// and an empty account id instead of an error.
+fn poll_codex(account: &CodexAccount) -> Result<UsageData, PollError> {
+    let strict = !account.is_default();
+    let creds = match read_codex_credentials(account) {
         Some(creds) => creds,
         None => {
-            diagnose::log("Codex usage poll failed: no Codex credentials found");
+            diagnose::log(format!(
+                "Codex usage poll failed: no credentials found for {}",
+                account.label
+            ));
             return Err(PollError::NoCredentials);
         }
     };
 
-    match fetch_codex_usage(&creds.access_token, creds.account_id.as_deref()) {
+    match fetch_codex_usage(&creds.access_token, creds.account_id.as_deref(), strict) {
         Ok(data) => Ok(data),
         Err(PollError::AuthRequired) => {
-            cli_refresh_codex_token();
-            let refreshed = read_codex_credentials().ok_or(PollError::TokenExpired)?;
-            fetch_codex_usage(&refreshed.access_token, refreshed.account_id.as_deref())
+            cli_refresh_codex_token(account, &creds.access_token);
+            let refreshed = read_codex_credentials(account).ok_or(PollError::TokenExpired)?;
+            fetch_codex_usage(
+                &refreshed.access_token,
+                refreshed.account_id.as_deref(),
+                strict,
+            )
         }
         Err(error) => Err(error),
     }
@@ -374,19 +460,47 @@ fn cli_refresh_wsl_token(distro: &str) {
     wait_for_refresh(&mut child);
 }
 
-fn cli_refresh_codex_token() {
-    let codex_path = resolve_windows_codex_path();
-    let is_cmd = codex_path.to_lowercase().ends_with(".cmd");
-    let is_ps1 = codex_path.to_lowercase().ends_with(".ps1");
+/// Serializes profile deletion with CLI refreshes, which can write credentials.
+pub static CODEX_PROFILE_WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn codex_refresh_is_current(account: &CodexAccount, expected_token: &str) -> bool {
+    read_codex_credentials(account)
+        .is_some_and(|credentials| credentials.access_token == expected_token)
+}
+
+fn cli_refresh_codex_token(account: &CodexAccount, expected_token: &str) {
+    let _profile_write = CODEX_PROFILE_WRITES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // A poll can finish after its profile was removed. Never let its refresh
+    // recreate a deleted home (or fall back to the main account).
+    if !codex_refresh_is_current(account, expected_token) {
+        return;
+    }
+    let codex_path = match resolve_windows_codex_path() {
+        Ok(path) => path,
+        Err(error) => {
+            diagnose::log_error("unable to find Codex CLI for token refresh", error);
+            return;
+        }
+    };
+    let extension = codex_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let is_cmd = extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat");
+    let is_ps1 = extension.eq_ignore_ascii_case("ps1");
     diagnose::log(format!(
-        "attempting Windows Codex token refresh via {codex_path}"
+        "attempting Windows Codex token refresh for {} via {}",
+        account.label,
+        codex_path.display()
     ));
 
     let args: &[&str] = &["exec", "."];
 
     let mut cmd = if is_cmd {
         let mut c = Command::new("cmd.exe");
-        c.arg("/c").arg(&codex_path).args(args);
+        configure_cmd_script(&mut c, &codex_path, args, "/c");
         c
     } else if is_ps1 {
         let mut c = Command::new("powershell.exe");
@@ -406,7 +520,11 @@ fn cli_refresh_codex_token() {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-
+    if let Some(home) = &account.home {
+        // The CLI resolves its login from CODEX_HOME, so refreshing an extra
+        // profile has to point the child at that profile's home directory.
+        cmd.env("CODEX_HOME", home);
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(error) => {
@@ -416,6 +534,66 @@ fn cli_refresh_codex_token() {
     };
 
     wait_for_refresh(&mut child);
+}
+
+/// Start `codex login` for a profile directory, so an extra account can be
+/// authorized without the user opening a terminal.
+///
+/// The CLI owns the OAuth flow, including which account the browser authorizes,
+/// and it needs an interactive terminal, so it is started in a console window of
+/// its own. The monitor only points `CODEX_HOME` at the profile and later reads
+/// the `auth.json` the CLI writes; it never handles the sign-in itself.
+pub fn spawn_codex_login(home: &Path) -> std::io::Result<()> {
+    // The CLI refuses to load a configuration from a missing directory, so the
+    // profile folder has to exist before it starts.
+    std::fs::create_dir_all(home)?;
+    let codex_path = resolve_windows_codex_path()?;
+    let extension = codex_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let is_script = extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat");
+    let is_ps1 = extension.eq_ignore_ascii_case("ps1");
+    diagnose::log(format!(
+        "starting Codex login for {} via {}",
+        home.display(),
+        codex_path.display()
+    ));
+
+    let mut cmd = if is_script {
+        // `/k` keeps the CLI's output on screen instead of letting the window
+        // flash past when the sign-in fails.
+        let mut c = Command::new("cmd.exe");
+        configure_cmd_script(&mut c, &codex_path, &["login"], "/k");
+        c
+    } else if is_ps1 {
+        let mut c = Command::new("powershell.exe");
+        c.arg("-NoProfile")
+            .arg("-NoExit")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-File")
+            .arg(&codex_path)
+            .arg("login");
+        c
+    } else {
+        let mut c = Command::new(&codex_path);
+        c.arg("login");
+        c
+    };
+    cmd.env("CODEX_HOME", home);
+    // A console window of its own: the CLI needs a terminal for the sign-in, and
+    // redirecting its streams would take that away.
+    cmd.creation_flags(CREATE_NEW_CONSOLE);
+    cmd.spawn().map(|_child| ())
+}
+
+/// Whether a profile directory already holds a usable login. Used to notice a
+/// finished `codex login`, and to ignore a half-written credentials file.
+pub fn codex_profile_ready(home: &Path) -> bool {
+    let account = CodexAccount::profile(String::new(), home.to_path_buf());
+    codex_auth_path_for(&account).is_some_and(|path| path.is_file())
+        && read_codex_credentials(&account).is_some()
 }
 
 /// Spawn a command and wait up to `timeout` for it to finish.
@@ -493,39 +671,61 @@ fn resolve_windows_claude_path() -> String {
     "claude.cmd".to_string()
 }
 
-fn resolve_windows_codex_path() -> String {
-    for name in &["codex.cmd", "codex.ps1", "codex.exe", "codex"] {
-        if Command::new(name)
-            .arg("--version")
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok()
-        {
-            return name.to_string();
+fn resolve_windows_codex_path() -> std::io::Result<PathBuf> {
+    let directories = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .unwrap_or_default();
+    codex_cli_in_directories(&directories)
+}
+
+/// Put the path in the child environment: CMD expands this once, so literal `%`
+/// characters in the expanded value (including `%NAME%`) are not re-expanded.
+fn cmd_script_command(args: &[&str], mode: &str) -> String {
+    let mut command = "\"%CODEX_CLI_SCRIPT_PATH%\"".to_string();
+    for arg in args {
+        command.push(' ');
+        command.push_str(arg);
+    }
+    // raw_arg is intentional: Rust's normal Windows quoting escapes embedded
+    // quotes for argv parsing, which CMD does not use when parsing /c or /k.
+    format!(" /d /v:off /s {mode} \"{command}\"")
+}
+
+fn configure_cmd_script(command: &mut Command, path: &Path, args: &[&str], mode: &str) {
+    command
+        .raw_arg(cmd_script_command(args, mode))
+        .env("CODEX_CLI_SCRIPT_PATH", path);
+}
+
+fn codex_cli_in_directories(directories: &[PathBuf]) -> std::io::Result<PathBuf> {
+    // Use native Unicode paths rather than decoding `where.exe` output, whose
+    // console code page need not be UTF-8 (notably for npm paths under usernames).
+    find_codex_cli(|name| {
+        directories
+            .iter()
+            .map(|directory| directory.join(name))
+            .find(|path| path.is_file())
+    })
+}
+
+fn find_codex_cli(mut find: impl FnMut(&str) -> Option<PathBuf>) -> std::io::Result<PathBuf> {
+    for name in [
+        "codex.cmd",
+        "codex.ps1",
+        "codex.exe",
+        "codex.bat",
+        "codex.com",
+        "codex",
+    ] {
+        if let Some(path) = find(name) {
+            return Ok(path);
         }
     }
 
-    for name in &["codex.cmd", "codex.ps1", "codex.exe", "codex"] {
-        if let Ok(output) = Command::new("where.exe")
-            .arg(name)
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-        {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(first_line) = stdout.lines().next() {
-                    let path = first_line.trim().to_string();
-                    if !path.is_empty() {
-                        return path;
-                    }
-                }
-            }
-        }
-    }
-
-    "codex.cmd".to_string()
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "Codex CLI was not found",
+    ))
 }
 
 fn build_agent() -> Result<ureq::Agent, PollError> {
@@ -558,13 +758,19 @@ fn classify_ureq_error(error: &ureq::Error) -> PollError {
 }
 
 pub fn credential_watch_snapshot(mode: CredentialWatchMode) -> CredentialWatchSnapshot {
-    if mode == CredentialWatchMode::Codex {
-        return codex_auth_path()
-            .map(|p| vec![windows_credential_watch_signature(&p)])
-            .unwrap_or_default();
-    }
-    if mode == CredentialWatchMode::Antigravity {
-        return vec![antigravity_credential_watch_signature()];
+    match mode {
+        CredentialWatchMode::Codex => {
+            return codex_auth_path()
+                .map(|p| vec![windows_credential_watch_signature(&p)])
+                .unwrap_or_default();
+        }
+        CredentialWatchMode::CodexProfile(home) => {
+            return vec![windows_credential_watch_signature(&home.join("auth.json"))];
+        }
+        CredentialWatchMode::Antigravity => {
+            return vec![antigravity_credential_watch_signature()];
+        }
+        CredentialWatchMode::ActiveSource | CredentialWatchMode::AllSources => {}
     }
 
     let sources = match mode {
@@ -572,7 +778,9 @@ pub fn credential_watch_snapshot(mode: CredentialWatchMode) -> CredentialWatchSn
             .map(|creds| vec![creds.source])
             .unwrap_or_else(all_known_credential_sources),
         CredentialWatchMode::AllSources => all_known_credential_sources(),
-        CredentialWatchMode::Antigravity | CredentialWatchMode::Codex => unreachable!(),
+        CredentialWatchMode::Antigravity
+        | CredentialWatchMode::Codex
+        | CredentialWatchMode::CodexProfile(_) => unreachable!(),
     };
 
     let mut snapshot: CredentialWatchSnapshot = sources
@@ -823,7 +1031,15 @@ fn parse_rate_limit_headers(response: &ureq::Response) -> UsageData {
     data
 }
 
-fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData, PollError> {
+/// `strict` requests an answer that names the requested account. The endpoint
+/// replies with the bearer token's own usage (and an empty account id) when the
+/// requested account is not the one the token belongs to, so a login the user
+/// configured separately must confirm the echo before its numbers are shown.
+fn fetch_codex_usage(
+    token: &str,
+    account_id: Option<&str>,
+    strict: bool,
+) -> Result<UsageData, PollError> {
     let agent = build_agent()?;
     let mut request = agent
         .get(CODEX_USAGE_URL)
@@ -851,7 +1067,29 @@ fn fetch_codex_usage(token: &str, account_id: Option<&str>) -> Result<UsageData,
         }
     };
 
+    if codex_account_mismatch(account_id, response.account_id.as_deref(), strict) {
+        diagnose::log("Codex usage endpoint answered for a different account");
+        return Err(PollError::AccountMismatch);
+    }
+
     codex_usage_from_response(response).ok_or(PollError::RequestFailed)
+}
+
+/// Whether a response belongs to a different login than the one requested.
+///
+/// The endpoint always answers HTTP 200, so the echo in the body is the only
+/// signal: a different account id is always a mismatch. An empty or missing
+/// echo is only treated as a mismatch when the caller asked strictly (an extra
+/// profile), because the default login has always been displayed from whatever
+/// the token reports.
+fn codex_account_mismatch(requested: Option<&str>, returned: Option<&str>, strict: bool) -> bool {
+    let Some(requested) = requested.filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    match returned.filter(|value| !value.is_empty()) {
+        Some(returned) => returned != requested,
+        None => strict,
+    }
 }
 
 fn codex_usage_from_response(response: CodexUsageResponse) -> Option<UsageData> {
@@ -1270,16 +1508,30 @@ fn read_credentials_from_source(source: &CredentialSource) -> Option<Credentials
     }
 }
 
-fn codex_auth_path() -> Option<PathBuf> {
+/// The default Codex home directory: `$CODEX_HOME`, or `~/.codex`.
+pub fn codex_home() -> Option<PathBuf> {
     if let Some(codex_home) = std::env::var_os("CODEX_HOME").map(PathBuf::from) {
-        return Some(codex_home.join("auth.json"));
+        return Some(codex_home);
     }
 
-    Some(dirs::home_dir()?.join(".codex").join("auth.json"))
+    Some(dirs::home_dir()?.join(".codex"))
 }
 
-fn read_codex_credentials() -> Option<CodexTokenData> {
-    let auth_path = codex_auth_path()?;
+fn codex_auth_path() -> Option<PathBuf> {
+    Some(codex_home()?.join("auth.json"))
+}
+
+/// Credentials file for a Codex login: the default location, or the profile's
+/// own `auth.json`.
+pub fn codex_auth_path_for(account: &CodexAccount) -> Option<PathBuf> {
+    match &account.home {
+        Some(home) => Some(home.join("auth.json")),
+        None => codex_auth_path(),
+    }
+}
+
+fn read_codex_credentials(account: &CodexAccount) -> Option<CodexTokenData> {
+    let auth_path = codex_auth_path_for(account)?;
     let content = match std::fs::read_to_string(&auth_path) {
         Ok(content) => content,
         Err(error) => {
@@ -1296,6 +1548,80 @@ fn read_codex_credentials() -> Option<CodexTokenData> {
 
     let auth: CodexAuthFile = serde_json::from_str(&content).ok()?;
     auth.tokens.filter(|tokens| !tokens.access_token.is_empty())
+}
+
+/// Quota identity from local credentials, never the display email. Keep the
+/// subject when available so different members of one workspace remain distinct.
+pub fn codex_account_identity(account: &CodexAccount) -> Option<(String, Option<String>)> {
+    let content = std::fs::read_to_string(codex_auth_path_for(account)?).ok()?;
+    let file: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let tokens = file.get("tokens")?;
+    let account_id = tokens.get("account_id")?.as_str()?.trim();
+    if account_id.is_empty() {
+        return None;
+    }
+    let subject = tokens
+        .get("id_token")
+        .and_then(|token| token.as_str())
+        .and_then(|token| id_token_claim(token, "sub"))
+        .filter(|subject| !subject.is_empty());
+    Some((account_id.to_string(), subject))
+}
+
+/// Display label for a login, read from the id token already stored in
+/// `auth.json`. The CLI cannot be asked without a terminal, so this is the only
+/// non-interactive source of an account name. Returns None when the file or the
+/// claim is unusable, letting callers fall back to other names.
+pub fn codex_account_label(account: &CodexAccount) -> Option<String> {
+    let content = std::fs::read_to_string(codex_auth_path_for(account)?).ok()?;
+    let file: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let id_token = file.get("tokens")?.get("id_token")?.as_str()?;
+    let email = id_token_claim(id_token, "email")?;
+    let email = email.trim();
+    if email.is_empty() {
+        None
+    } else {
+        Some(email.to_string())
+    }
+}
+
+/// Read one string claim from a JWT payload. The signature is not verified:
+/// this only ever labels a login the user already configured locally.
+fn id_token_claim(token: &str, claim: &str) -> Option<String> {
+    let payload = token.split('.').nth(1)?;
+    let decoded = base64url_decode(payload)?;
+    let json: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    json.get(claim)?.as_str().map(|value| value.to_string())
+}
+
+/// Minimal unpadded base64url decoder, enough for JWT payload segments.
+fn base64url_decode(input: &str) -> Option<Vec<u8>> {
+    fn digit(byte: u8) -> Option<u32> {
+        match byte {
+            b'A'..=b'Z' => Some((byte - b'A') as u32),
+            b'a'..=b'z' => Some((byte - b'a') as u32 + 26),
+            b'0'..=b'9' => Some((byte - b'0') as u32 + 52),
+            b'-' | b'+' => Some(62),
+            b'_' | b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buffer = 0u32;
+    let mut bits = 0u32;
+    for byte in input.bytes() {
+        if byte == b'=' {
+            break;
+        }
+        buffer = (buffer << 6) | digit(byte)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+        }
+    }
+    Some(out)
 }
 
 fn read_antigravity_credentials() -> Option<AntigravityTokenData> {
@@ -1698,6 +2024,126 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wsl_text_decoding_preserves_utf16_and_utf8_output() {
+        let text = "Ubuntu\r\n";
+        let encoded: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert_eq!(decode_wsl_text(&encoded), text);
+
+        let unicode = "Ubuntu 日本語 😀\r\n";
+        let with_bom: Vec<u8> = std::iter::once(0xFEFF)
+            .chain(unicode.encode_utf16())
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(decode_wsl_text(&with_bom), unicode);
+        assert_eq!(decode_wsl_text(unicode.as_bytes()), unicode);
+        assert_eq!(decode_wsl_text(&[]), "");
+    }
+
+    #[test]
+    fn utf16_detection_handles_short_odd_and_invalid_input() {
+        for bytes in [&[][..], &[0], &[b'A', 0, b'B']] {
+            assert_eq!(decode_utf16le(bytes), None);
+        }
+        assert!(!looks_like_utf16le(&[]));
+        // Detection ignores an incomplete trailing unit, as before.
+        assert!(looks_like_utf16le(&[b'A', 0, b'B']));
+        assert_eq!(decode_utf16le(&[0xFF, 0xFE]), Some(String::new()));
+        assert_eq!(
+            decode_utf16le(&[0xFF, 0xFE, 0x00, 0xD8]),
+            Some("\u{FFFD}".into())
+        );
+    }
+
+    #[test]
+    fn leap_years_follow_gregorian_century_rules() {
+        for (year, expected) in [(1900, false), (2000, true), (2024, true), (2025, false)] {
+            assert_eq!(is_leap(year), expected, "year {year}");
+        }
+    }
+
+    #[test]
+    fn missing_codex_cli_is_a_resolution_error_not_a_fake_script_path() {
+        let error = find_codex_cli(|_| None).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        let mut searched = Vec::new();
+        let path = find_codex_cli(|name| {
+            searched.push(name.to_string());
+            (name == "codex.exe").then(|| PathBuf::from(r"C:\Program Files\Codex\codex.exe"))
+        })
+        .unwrap();
+        assert_eq!(path, PathBuf::from(r"C:\Program Files\Codex\codex.exe"));
+        assert_eq!(searched, ["codex.cmd", "codex.ps1", "codex.exe"]);
+    }
+
+    #[test]
+    fn stale_polls_cannot_refresh_deleted_or_replaced_profile_credentials() {
+        let home = std::env::var_os("LOCALAPPDATA")
+            .map(|base| PathBuf::from(base).join("Temp").join("opencode"))
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!(
+                "codex-refresh-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        let account = CodexAccount::profile("test", home.clone());
+        assert!(!codex_refresh_is_current(&account, "old-token"));
+        assert!(!home.exists());
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("auth.json"),
+            r#"{"tokens":{"access_token":"new-token","account_id":"new-account"}}"#,
+        )
+        .unwrap();
+        assert!(!codex_refresh_is_current(&account, "old-token"));
+        assert!(codex_refresh_is_current(&account, "new-token"));
+        std::fs::remove_dir_all(&home).unwrap();
+        assert!(!codex_refresh_is_current(&account, "new-token"));
+        assert!(!home.exists());
+    }
+
+    #[test]
+    fn codex_cli_discovery_preserves_unicode_installation_paths() {
+        let root = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("Temp")
+            .join("opencode")
+            .join(format!("codex-cli-{}", std::process::id()));
+        let directory = root.join("安装😀 O’Brien");
+        std::fs::create_dir_all(&directory).unwrap();
+        let executable = directory.join("codex.cmd");
+        std::fs::write(&executable, "test-only discovery fixture").unwrap();
+        assert_eq!(codex_cli_in_directories(&[directory]).unwrap(), executable);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cmd_script_invocation_handles_literal_percent_in_install_path() {
+        let root = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("Temp/opencode/cmd-script-%NAME%-test")
+            .join(format!("{} & tools", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let script = root.join("codex.cmd");
+        let output = root.join("result.txt");
+        std::fs::write(
+            &script,
+            "@echo off\r\necho %* > \"%CODEX_TEST_OUTPUT%\"\r\n",
+        )
+        .unwrap();
+        let mut command = Command::new("cmd.exe");
+        configure_cmd_script(&mut command, &script, &["hello"], "/c");
+        let status = command.env("CODEX_TEST_OUTPUT", &output).status().unwrap();
+        assert!(status.success());
+        assert_eq!(std::fs::read_to_string(output).unwrap().trim(), "hello");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn credential_signature_detects_same_length_rewrites_within_one_second() {
         let path = std::env::temp_dir().join(format!(
             "quota-credential-signature-{}.json",
@@ -1731,6 +2177,83 @@ mod tests {
             windows_credentials_path_from(None, Some(PathBuf::from(r"C:\Users\Ray"))),
             Some(PathBuf::from(r"C:\Users\Ray\.claude\.credentials.json"))
         );
+    }
+
+    #[test]
+    fn codex_profile_login_resolves_its_own_auth_file_and_alert_key() {
+        let default = CodexAccount::default_account("Codex");
+        assert!(default.is_default());
+        assert_eq!(default.key, CODEX_DEFAULT_ACCOUNT_KEY);
+        // The default login keeps its legacy key so existing persisted alert
+        // dedup entries stay valid after upgrading.
+        assert!(default.home.is_none());
+
+        let profile = CodexAccount::profile("work", PathBuf::from(r"C:\Users\Ray\.codex-work"));
+        assert!(!profile.is_default());
+        assert_ne!(profile.key, CODEX_DEFAULT_ACCOUNT_KEY);
+        assert_eq!(
+            codex_auth_path_for(&profile),
+            Some(PathBuf::from(r"C:\Users\Ray\.codex-work\auth.json"))
+        );
+    }
+
+    #[test]
+    fn codex_account_mismatch_needs_a_matching_echo_for_profiles() {
+        // No account id was requested, so nothing can be wrong.
+        assert!(!codex_account_mismatch(None, Some("other"), false));
+        assert!(!codex_account_mismatch(Some(""), Some("other"), true));
+        // A named, different account is always a mismatch.
+        assert!(codex_account_mismatch(Some("a"), Some("b"), false));
+        assert!(!codex_account_mismatch(Some("a"), Some("a"), false));
+        // An empty echo is the endpoint's way of saying "not your account".
+        // Only an extra profile is treated strictly; the default login has to
+        // keep displaying whatever its own token reports.
+        assert!(!codex_account_mismatch(Some("a"), Some(""), false));
+        assert!(!codex_account_mismatch(Some("a"), None, false));
+        assert!(codex_account_mismatch(Some("a"), Some(""), true));
+        assert!(codex_account_mismatch(Some("a"), None, true));
+    }
+
+    #[test]
+    fn codex_account_label_reads_the_stored_id_token_email() {
+        let dir = std::env::temp_dir().join(format!(
+            "quota-codex-label-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let account = CodexAccount::profile("", dir.clone());
+
+        // No file yet: the caller has to fall back to another name.
+        assert_eq!(codex_account_label(&account), None);
+
+        let id_token = concat!(
+            "eyJhbGciOiJub25lIn0.",
+            "eyJlbWFpbCI6IndvcmtAZXhhbXBsZS5jb20iLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9wbGFuX3R5cGUiOiJwbHVzIn19",
+            ".signature"
+        );
+        std::fs::write(
+            dir.join("auth.json"),
+            format!(r#"{{"tokens":{{"access_token":"token","id_token":"{id_token}"}}}}"#),
+        )
+        .unwrap();
+        assert_eq!(
+            codex_account_label(&account),
+            Some("work@example.com".to_string())
+        );
+
+        // A token that is not a JWT must not panic or invent a name.
+        std::fs::write(
+            dir.join("auth.json"),
+            r#"{"tokens":{"id_token":"not-a-jwt"}}"#,
+        )
+        .unwrap();
+        assert_eq!(codex_account_label(&account), None);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

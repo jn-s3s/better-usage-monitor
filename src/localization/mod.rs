@@ -147,6 +147,40 @@ mod tests {
     use super::LanguageId;
 
     #[test]
+    fn codex_account_translations_have_complete_templates() {
+        for language in LanguageId::ALL {
+            let strings = language.strings().codex_accounts;
+            assert!(strings.remove.contains("{label}"));
+            assert!(strings.remove_confirm.contains("{label}"));
+            assert!(strings.remove_confirm.contains("{path}"));
+            assert!(strings.remove_failed.contains("{error}"));
+            assert!(strings.removed_deleted.contains("{label}"));
+            assert!(strings.duplicate.contains("{label}"));
+            assert!(!strings.restore.is_empty());
+            assert!(!strings.started.contains("{folder}"));
+            assert!(!strings.cancelled.contains("{folder}"));
+            assert!(strings.limit.contains("{limit}"));
+            assert!(!strings.reauthenticate.is_empty());
+            assert!(!strings.reauthenticate.contains("{help}"));
+            assert!(!strings.failed.is_empty());
+            assert!(!strings.failed.contains("{help}"));
+            for value in [
+                strings.hidden,
+                strings.profile_failed,
+                strings.missing_cli,
+                strings.mismatch,
+            ] {
+                assert!(!value.is_empty());
+            }
+            assert!(strings.hidden.contains("{models}"));
+        }
+        assert_eq!(
+            LanguageId::SimplifiedChinese.strings().codex_accounts.menu,
+            "Codex 账号"
+        );
+    }
+
+    #[test]
     fn parses_simplified_chinese_locales() {
         assert_eq!(
             LanguageId::from_code("zh-CN"),
@@ -180,7 +214,40 @@ mod tests {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub struct CodexAccountStrings {
+    pub menu: &'static str,
+    pub add: &'static str,
+    pub restore: &'static str,
+    pub duplicate: &'static str,
+    pub cancel: &'static str,
+    pub remove: &'static str,
+    pub main_suffix: &'static str,
+    pub title: &'static str,
+    pub started: &'static str,
+    pub cancelled: &'static str,
+    pub added_title: &'static str,
+    pub added: &'static str,
+    pub timed_out_title: &'static str,
+    pub timed_out: &'static str,
+    pub failed_title: &'static str,
+    pub failed: &'static str,
+    pub removed_title: &'static str,
+    pub removed: &'static str,
+    pub remove_confirm: &'static str,
+    pub remove_failed: &'static str,
+    pub removed_deleted: &'static str,
+    pub limit_title: &'static str,
+    pub limit: &'static str,
+    pub reauthenticate: &'static str,
+    pub hidden: &'static str,
+    pub profile_failed: &'static str,
+    pub missing_cli: &'static str,
+    pub mismatch: &'static str,
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct Strings {
+    pub codex_accounts: CodexAccountStrings,
     pub window_title: &'static str,
     pub refresh: &'static str,
     pub update_frequency: &'static str,
@@ -220,7 +287,6 @@ pub struct Strings {
     pub token_expired_title: &'static str,
     pub token_expired_body: &'static str,
     pub codex_token_expired_title: &'static str,
-    pub codex_token_expired_body: &'static str,
     pub antigravity_token_expired_title: &'static str,
     pub antigravity_token_expired_body: &'static str,
     pub codex_window_title: &'static str,

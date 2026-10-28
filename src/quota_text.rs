@@ -77,25 +77,31 @@ fn text(hdc: HDC, value: &str, mut rect: RECT, flags: DRAW_TEXT_FORMAT) {
     }
 }
 
+/// Quota text layout in physical pixels, with a logical font size.
+pub struct QuotaText<'a> {
+    pub x: i32,
+    pub y: i32,
+    pub height: i32,
+    pub width: i32,
+    pub value: &'a str,
+    pub primary: &'a Color,
+    pub secondary: &'a Color,
+    pub font_px: i32,
+}
+
 /// Each digit occupies a fixed cell; reset text starts at the same x for
 /// 0%, 9%, 99% and 100%. Status labels remain in the percentage column.
-/// `x`, `y`, `height` and `width` are physical pixels; `font_px` is logical.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "GDI text rendering needs explicit geometry, colors, and DPI scaling"
-)]
-pub fn draw(
-    hdc: HDC,
-    x: i32,
-    y: i32,
-    height: i32,
-    width: i32,
-    value: &str,
-    primary: &Color,
-    secondary: &Color,
-    font_px: i32,
-    scale: impl Fn(i32) -> i32,
-) {
+pub fn draw(hdc: HDC, layout: QuotaText<'_>, scale: impl Fn(i32) -> i32) {
+    let QuotaText {
+        x,
+        y,
+        height,
+        width,
+        value,
+        primary,
+        secondary,
+        font_px,
+    } = layout;
     let (percentage, reset) = parts(value);
     let rect = RECT {
         left: x,

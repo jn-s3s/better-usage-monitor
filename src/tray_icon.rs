@@ -2,8 +2,8 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
 use windows::Win32::UI::Shell::{
-    ExtractIconExW, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_WARNING,
-    NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
+    ExtractIconExW, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO,
+    NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -34,6 +34,12 @@ pub enum TrayIconKind {
 
 pub struct TrayIconData {
     pub tooltip: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoticeSeverity {
+    Information,
+    Warning,
 }
 
 /// Load the same embedded icon used by the executable and desktop shortcut.
@@ -76,13 +82,25 @@ fn load_embedded_app_icon() -> HICON {
 
 /// Show a Windows balloon notification from the single application tray icon.
 pub fn notify_balloon(hwnd: HWND, _kind: TrayIconKind, title: &str, message: &str) {
+    notify_balloon_with_severity(hwnd, title, message, NoticeSeverity::Warning);
+}
+
+pub fn notify_balloon_with_severity(
+    hwnd: HWND,
+    title: &str,
+    message: &str,
+    severity: NoticeSeverity,
+) {
     unsafe {
         let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
         nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
         nid.hWnd = hwnd;
         nid.uID = APP_TRAY_ICON_ID;
         nid.uFlags = NIF_INFO;
-        nid.dwInfoFlags = NIIF_WARNING;
+        nid.dwInfoFlags = match severity {
+            NoticeSeverity::Information => NIIF_INFO,
+            NoticeSeverity::Warning => NIIF_WARNING,
+        };
         copy_wide(title, &mut nid.szInfoTitle);
         copy_wide(message, &mut nid.szInfo);
         let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
@@ -99,6 +117,21 @@ fn copy_wide<const N: usize>(s: &str, buf: &mut [u16; N]) {
     buf[len] = 0;
 }
 
+/// Windows allows 127 UTF-16 units plus the terminator. Mark omitted content
+/// explicitly without splitting a surrogate pair; the widget tooltip has the
+/// full account list.
+fn copy_tooltip(s: &str, buf: &mut [u16; 128]) {
+    copy_wide(s, buf);
+    if s.encode_utf16().count() >= buf.len() {
+        let mut end = buf.len() - 2;
+        if (0xD800..=0xDBFF).contains(&buf[end - 1]) {
+            end -= 1;
+        }
+        buf[end] = '…' as u16;
+        buf[end + 1] = 0;
+    }
+}
+
 fn add(hwnd: HWND, tooltip: &str) {
     let hicon = create_icon();
     unsafe {
@@ -109,7 +142,7 @@ fn add(hwnd: HWND, tooltip: &str) {
         nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         nid.uCallbackMessage = WM_APP_TRAY;
         nid.hIcon = hicon;
-        copy_wide(tooltip, &mut nid.szTip);
+        copy_tooltip(tooltip, &mut nid.szTip);
         let _ = Shell_NotifyIconW(NIM_ADD, &nid);
         if !hicon.is_invalid() {
             let _ = DestroyIcon(hicon);
@@ -126,7 +159,7 @@ fn update(hwnd: HWND, tooltip: &str) {
         nid.uID = APP_TRAY_ICON_ID;
         nid.uFlags = NIF_ICON | NIF_TIP;
         nid.hIcon = hicon;
-        copy_wide(tooltip, &mut nid.szTip);
+        copy_tooltip(tooltip, &mut nid.szTip);
         let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
         if !hicon.is_invalid() {
             let _ = DestroyIcon(hicon);
@@ -170,5 +203,42 @@ pub fn handle_message(lparam: LPARAM) -> TrayAction {
         WM_LBUTTONUP => TrayAction::ToggleWidget,
         WM_RBUTTONUP => TrayAction::ShowContextMenu,
         _ => TrayAction::None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::copy_tooltip;
+
+    fn tooltip(text: &str) -> String {
+        let mut buffer = [0u16; 128];
+        copy_tooltip(text, &mut buffer);
+        let end = buffer.iter().position(|unit| *unit == 0).unwrap();
+        String::from_utf16(&buffer[..end]).unwrap()
+    }
+
+    #[test]
+    fn tray_tooltip_preserves_text_that_fits() {
+        for text in [String::new(), "Codex: 5h 62%".into(), "x".repeat(127)] {
+            assert_eq!(tooltip(&text), text);
+        }
+    }
+
+    #[test]
+    fn tray_tooltip_marks_truncated_accounts() {
+        let text = format!("work@example.com: 5h 62%\n{}", "other account\n".repeat(20));
+        let result = tooltip(&text);
+        assert!(result.starts_with("work@example.com: 5h 62%\n"));
+        assert!(result.ends_with('…'));
+        assert_eq!(result.encode_utf16().count(), 127);
+    }
+
+    #[test]
+    fn tray_tooltip_keeps_surrogate_pairs_intact() {
+        for prefix in [124, 125, 126] {
+            let result = tooltip(&format!("{}😀{}", "x".repeat(prefix), "y".repeat(10)));
+            assert!(result.ends_with('…'));
+            assert!(result.encode_utf16().count() <= 127);
+        }
     }
 }
