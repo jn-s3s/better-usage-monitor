@@ -136,6 +136,54 @@ pub fn find_child_window(parent: HWND, class_name: &str) -> Option<HWND> {
     }
 }
 
+/// Find the left edge of the notification area or secondary-taskbar clock.
+/// Some Windows versions expose the clock below an intermediate child window.
+pub fn taskbar_notification_left(taskbar: HWND, taskbar_rect: RECT) -> Option<i32> {
+    struct Search {
+        rect: RECT,
+        left: Option<i32>,
+    }
+
+    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        // SAFETY: EnumChildWindows calls this synchronously with our live Search.
+        let search = unsafe { &mut *(lparam.0 as *mut Search) };
+        let mut class = [0u16; 128];
+        // SAFETY: The buffer is valid and hwnd comes from EnumChildWindows.
+        let len = unsafe { GetClassNameW(hwnd, &mut class) };
+        let class = String::from_utf16_lossy(&class[..len as usize]);
+        if matches!(class.as_str(), "TrayNotifyWnd" | "TrayClockWClass" | "ClockButton")
+            // SAFETY: hwnd comes from EnumChildWindows.
+            && unsafe { IsWindowVisible(hwnd) }.as_bool()
+        {
+            if let Some(rect) = get_window_rect_safe(hwnd) {
+                if rect.right > rect.left
+                    && rect.left >= search.rect.left
+                    && rect.left < search.rect.right
+                    && rect.bottom > search.rect.top
+                    && rect.top < search.rect.bottom
+                {
+                    search.left = Some(search.left.map_or(rect.left, |left| left.min(rect.left)));
+                }
+            }
+        }
+        BOOL(1)
+    }
+
+    let mut search = Search {
+        rect: taskbar_rect,
+        left: None,
+    };
+    // SAFETY: Search remains live throughout the synchronous enumeration.
+    unsafe {
+        let _ = EnumChildWindows(
+            taskbar,
+            Some(enum_proc),
+            LPARAM(&mut search as *mut _ as isize),
+        );
+    }
+    search.left
+}
+
 /// Get taskbar position via SHAppBarMessage
 pub fn get_taskbar_rect(taskbar_hwnd: HWND) -> Option<RECT> {
     unsafe {
@@ -178,9 +226,11 @@ pub fn embed_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) {
     unsafe {
         // Preserve existing extended style, add tool window + no activate
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
         // Reset alpha mode used by the startup popup fallback before switching
-        // back to UpdateLayeredWindow rendering inside the taskbar.
-        if ex_style & WS_EX_LAYERED.0 as i32 != 0 {
+        // back to UpdateLayeredWindow rendering inside the taskbar. Already
+        // embedded windows must retain their layered surface when reparented.
+        if style & WS_POPUP_STYLE != 0 && ex_style & WS_EX_LAYERED.0 as i32 != 0 {
             let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style & !(WS_EX_LAYERED.0 as i32));
         }
         let _ = SetWindowLongW(
@@ -190,7 +240,6 @@ pub fn embed_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) {
         );
 
         // Change from popup to child
-        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
         let new_style = (style & !WS_POPUP_STYLE) | WS_CHILD_STYLE | WS_CLIPSIBLINGS_STYLE;
         let _ = SetWindowLongW(hwnd, GWL_STYLE, new_style as i32);
 
@@ -206,7 +255,7 @@ mod attachment_tests {
     use windows::Win32::Graphics::Gdi::*;
 
     #[test]
-    fn startup_popup_can_switch_to_layered_child_rendering() {
+    fn startup_popup_and_taskbar_switch_preserve_layered_rendering() {
         unsafe {
             let parent = CreateWindowExW(
                 WINDOW_EX_STYLE(0),
@@ -241,6 +290,21 @@ mod attachment_tests {
             SetLayeredWindowAttributes(child, COLORREF(0), 255, LWA_ALPHA).unwrap();
             embed_in_taskbar(child, parent);
             assert_eq!(GetParent(child).unwrap(), parent);
+            let second_parent = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("second-taskbar-test"),
+                WS_POPUP,
+                100,
+                0,
+                20,
+                20,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
             let dc = CreateCompatibleDC(None);
             let info = BITMAPINFO {
                 bmiHeader: BITMAPINFOHEADER {
@@ -276,14 +340,32 @@ mod attachment_tests {
                 Some(&blend),
                 ULW_ALPHA,
             );
+            assert!(
+                rendered.is_ok(),
+                "fallback alpha mode must not prevent taskbar rendering: {rendered:?}"
+            );
+            embed_in_taskbar(child, second_parent);
+            assert_eq!(GetParent(child).unwrap(), second_parent);
+            let rendered_after_switch = UpdateLayeredWindow(
+                child,
+                None,
+                Some(&point),
+                Some(&size),
+                dc,
+                Some(&point),
+                COLORREF(0),
+                Some(&blend),
+                ULW_ALPHA,
+            );
             let _ = SelectObject(dc, old);
             let _ = DeleteObject(bitmap);
             let _ = DeleteDC(dc);
             let _ = DestroyWindow(child);
+            let _ = DestroyWindow(second_parent);
             let _ = DestroyWindow(parent);
             assert!(
-                rendered.is_ok(),
-                "fallback alpha mode must not prevent taskbar rendering: {rendered:?}"
+                rendered_after_switch.is_ok(),
+                "switching taskbars must preserve layered rendering: {rendered_after_switch:?}"
             );
         }
     }

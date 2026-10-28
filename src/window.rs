@@ -1805,13 +1805,21 @@ fn taskbar_at_point(pt: POINT) -> Option<(usize, native_interop::TaskbarWindow)>
 }
 
 fn tray_left_for_taskbar(taskbar_hwnd: HWND, taskbar_rect: RECT) -> i32 {
-    let mut tray_left = taskbar_rect.right;
-    if let Some(tray_hwnd) = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd") {
-        if let Some(tray_rect) = native_interop::get_window_rect_safe(tray_hwnd) {
-            tray_left = tray_rect.left;
-        }
-    }
-    tray_left
+    let notification_left = native_interop::taskbar_notification_left(taskbar_hwnd, taskbar_rect);
+    // SAFETY: This handle belongs to the taskbar selected by window enumeration.
+    let dpi = unsafe { GetDpiForWindow(taskbar_hwnd) }.max(96);
+    taskbar_content_right(taskbar_rect, notification_left, dpi)
+}
+
+fn taskbar_content_right(rect: RECT, notification_left: Option<i32>, dpi: u32) -> i32 {
+    // Windows 11 can render the secondary clock and bell in XAML without a
+    // dedicated child HWND. Reserve space rather than covering those controls.
+    notification_left.unwrap_or_else(|| {
+        // Allow for the two-line clock/date, bell, and edge padding without
+        // reserving the primary taskbar's additional system-tray icon space.
+        let reserved_width = (112.0 * dpi as f64 / 96.0).round() as i32;
+        (rect.right - reserved_width).max(rect.left)
+    })
 }
 
 fn clamp_offset_for_taskbar(taskbar_hwnd: HWND, taskbar_rect: RECT, offset: i32) -> i32 {
@@ -2616,8 +2624,7 @@ fn usage_layout_widths(language: LanguageId, appearance: Appearance) -> (i32, i3
         } else {
             (
                 measure(label_font, &mut labels.into_iter()) + sc(2),
-                (reset_x + measure(reset_font, &mut resets.iter().map(String::as_str)) + sc(3))
-                    .max(fallback.1),
+                reset_x + measure(reset_font, &mut resets.iter().map(String::as_str)) + sc(3),
             )
         };
         ReleaseDC(HWND::default(), hdc);
@@ -4301,15 +4308,9 @@ fn position_at_taskbar() {
     };
 
     let taskbar_height = taskbar_rect.bottom - taskbar_rect.top;
-    let mut tray_left = taskbar_rect.right;
+    let tray_left = tray_left_for_taskbar(taskbar_hwnd, taskbar_rect);
     let anchor_top = taskbar_rect.top;
     let anchor_height = taskbar_height;
-
-    if let Some(tray_hwnd) = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd") {
-        if let Some(tray_rect) = native_interop::get_window_rect_safe(tray_hwnd) {
-            tray_left = tray_rect.left;
-        }
-    }
 
     let widget_width = total_widget_width();
     let max_offset = (tray_left - taskbar_rect.left - widget_width).max(0);
@@ -4635,16 +4636,7 @@ unsafe extern "system" fn wnd_proc(
                     // Clamp: don't go past left edge of taskbar
                     if let Some(taskbar_hwnd) = taskbar_hwnd {
                         if let Some(taskbar_rect) = native_interop::get_taskbar_rect(taskbar_hwnd) {
-                            let mut tray_left = taskbar_rect.right;
-                            if let Some(tray_hwnd) =
-                                native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd")
-                            {
-                                if let Some(tray_rect) =
-                                    native_interop::get_window_rect_safe(tray_hwnd)
-                                {
-                                    tray_left = tray_rect.left;
-                                }
-                            }
+                            let tray_left = tray_left_for_taskbar(taskbar_hwnd, taskbar_rect);
                             let widget_width = total_widget_width_for_state(s);
                             let max_offset = (tray_left - taskbar_rect.left - widget_width).max(0);
                             if new_offset > max_offset {
@@ -6369,11 +6361,18 @@ mod tests {
                         assert!(width <= label_width, "{language:?}: {label:?}");
                         assert!(height <= appearance.row_height(), "{language:?}: {label:?}");
                     }
+                    let mut widest_reset = 0;
                     for reset in &resets {
                         let (width, height) = width_of(reset_font, reset);
+                        widest_reset = widest_reset.max(width);
                         assert!(width <= reset_width, "{language:?}: {reset:?}");
                         assert!(height <= appearance.row_height(), "{language:?}: {reset:?}");
                     }
+                    assert_eq!(
+                        reset_width,
+                        widest_reset + sc(3),
+                        "{language:?}: reset column must not retain legacy minimum-width padding"
+                    );
                     let _ = DeleteObject(label_font);
                     let _ = DeleteObject(reset_font);
                 }
@@ -6537,6 +6536,36 @@ mod tests {
             poll_error_display_label(poller::PollError::RequestFailed, LanguageId::English),
             "ERR"
         );
+    }
+
+    #[test]
+    fn right_anchor_keeps_secondary_clock_and_bell_clear() {
+        for left in [-2560, 0, 2560] {
+            for (dpi, reserved) in [(96, 112), (144, 168), (192, 224)] {
+                let rect = RECT {
+                    left,
+                    top: 1000,
+                    right: left + 2560,
+                    bottom: 1048,
+                };
+                let boundary = taskbar_content_right(rect, None, dpi);
+                assert_eq!(boundary, rect.right - reserved);
+                let widget_left = compute_anchor_x(left, boundary, 606, 0, false);
+                assert_eq!(widget_left + 606, boundary);
+
+                // Prefer actual tray/clock bounds over the XAML fallback.
+                assert_eq!(
+                    taskbar_content_right(rect, Some(rect.right - 400), dpi),
+                    rect.right - 400
+                );
+            }
+        }
+        let narrow = RECT {
+            left: 200,
+            right: 300,
+            ..RECT::default()
+        };
+        assert_eq!(taskbar_content_right(narrow, None, 192), narrow.left);
     }
 
     #[test]
