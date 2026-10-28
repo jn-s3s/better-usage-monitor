@@ -80,6 +80,10 @@ fn text(hdc: HDC, value: &str, mut rect: RECT, flags: DRAW_TEXT_FORMAT) {
 /// Each digit occupies a fixed cell; reset text starts at the same x for
 /// 0%, 9%, 99% and 100%. Status labels remain in the percentage column.
 /// `x`, `y`, `height` and `width` are physical pixels; `font_px` is logical.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "GDI text rendering needs explicit geometry, colors, and DPI scaling"
+)]
 pub fn draw(
     hdc: HDC,
     x: i32,
