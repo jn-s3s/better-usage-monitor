@@ -76,6 +76,25 @@ cargo build --release
 
 Local builds create the executable at `target\release\codex-usage.exe`.
 
+### Development checks
+
+`dev` is this fork's default branch. Create feature or fix branches and submit all
+development PRs to `dev`; direct pushes to `dev` are blocked, including for admins.
+Keep `main` as an upstream mirror: do not target it with development PRs or add
+fork-specific commits. Updates to `main` are restricted to repository admins for
+deliberate upstream synchronization; that bypass also permits other updates, so
+admins must preserve the mirror policy.
+
+Every pull request targeting `dev`, including draft PRs, runs these checks on Windows
+with stable Rust. Run the same checks locally before submitting changes:
+
+```powershell
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo build --release --locked
+```
+
 ## Uninstall
 
 Uninstall **Codex Usage** from Windows Settings > Apps > Installed apps, or run:

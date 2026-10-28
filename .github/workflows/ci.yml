@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [dev]
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: ${{ matrix.check.name }}
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        check:
+          - name: Formatting
+            command: cargo fmt --all -- --check
+          - name: Clippy
+            command: cargo clippy --workspace --all-targets --locked -- -D warnings
+          - name: Tests
+            command: cargo test --workspace --locked
+          - name: Release build
+            command: cargo build --release --locked
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Run check
+        shell: pwsh
+        run: ${{ matrix.check.command }}
