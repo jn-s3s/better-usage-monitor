@@ -2414,6 +2414,10 @@ fn render_layered() {
 }
 
 /// Paint all widget content onto a DC with a given background color.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Both GDI paint paths pass an explicit snapshot of widget and provider state"
+)]
 fn paint_content(
     hdc: HDC,
     width: i32,
@@ -2711,7 +2715,7 @@ fn complete_provider_poll(
             return;
         };
         let completion = s.monitor.finish(
-            &job,
+            job,
             attempt,
             Instant::now(),
             SystemTime::now(),
@@ -3656,10 +3660,12 @@ unsafe extern "system" fn wnd_proc(
                                         s.show_codex = !s.show_codex;
                                     }
                                 }
-                                IDM_MODEL_ANTIGRAVITY => {
-                                    if s.show_claude_code || s.show_codex || !s.show_antigravity {
-                                        s.show_antigravity = !s.show_antigravity;
-                                    }
+                                IDM_MODEL_ANTIGRAVITY
+                                    if s.show_claude_code
+                                        || s.show_codex
+                                        || !s.show_antigravity =>
+                                {
+                                    s.show_antigravity = !s.show_antigravity;
                                 }
                                 _ => {}
                             }
@@ -4499,6 +4505,10 @@ fn paint(hdc: HDC, hwnd: HWND) {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The row renderer receives layout and display values for three independent providers"
+)]
 fn draw_row(
     hdc: HDC,
     x: i32,
@@ -4625,6 +4635,10 @@ fn usage_bar_fill_percentage(percent: f64, text: &str) -> f64 {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "GDI bar rendering needs explicit geometry, quota text, and appearance values"
+)]
 fn draw_usage_bar(
     hdc: HDC,
     bar_x: i32,
