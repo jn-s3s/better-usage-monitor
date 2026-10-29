@@ -729,6 +729,12 @@ fn spawn_taskbar_watchdog() {
         let Some(old) = stored else {
             continue;
         };
+        // EnumWindows may temporarily omit the taskbar while Start/Search is
+        // open. A live taskbar is not an Explorer restart, regardless of that list.
+        // SAFETY: IsWindow accepts stale handles and does not retain references.
+        if unsafe { IsWindow(old) }.as_bool() {
+            continue;
+        }
         let taskbars = native_interop::find_taskbars();
         if !taskbars.is_empty() && !taskbars.iter().any(|taskbar| taskbar.hwnd == old) {
             let new = taskbars[0].hwnd;
