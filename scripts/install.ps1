@@ -129,6 +129,33 @@ try {
     }
 
     try {
+        $UninstallerBackup = Join-Path $TempDirectory 'uninstall.ps1.old'
+        $MenuShortcutBackup = Join-Path $TempDirectory 'menu.lnk.old'
+        $DesktopShortcutBackup = Join-Path $TempDirectory 'desktop.lnk.old'
+        $RegistryBackup = Join-Path $TempDirectory 'uninstall.reg'
+        $HadPreviousUninstaller = Test-Path -LiteralPath $InstalledUninstaller -PathType Leaf
+        $HadPreviousMenuShortcut = Test-Path -LiteralPath $ShortcutPath -PathType Leaf
+        $HadPreviousDesktopShortcut = Test-Path -LiteralPath $DesktopShortcutPath -PathType Leaf
+        $HadPreviousUninstallKey = Test-Path -LiteralPath $UninstallKey
+        $RegistryBackupCreated = $false
+
+        if ($HadPreviousUninstaller) {
+            Copy-Item -LiteralPath $InstalledUninstaller -Destination $UninstallerBackup
+        }
+        if ($HadPreviousMenuShortcut) {
+            Copy-Item -LiteralPath $ShortcutPath -Destination $MenuShortcutBackup
+        }
+        if ($HadPreviousDesktopShortcut) {
+            Copy-Item -LiteralPath $DesktopShortcutPath -Destination $DesktopShortcutBackup
+        }
+        if ($HadPreviousUninstallKey) {
+            & reg.exe export 'HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexUsage' $RegistryBackup /y | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                throw 'Could not back up the existing uninstall registry entry.'
+            }
+            $RegistryBackupCreated = $true
+        }
+
         Copy-Item -LiteralPath $StagedUninstaller -Destination $InstalledUninstaller -Force
 
         $InstalledVersion = (Get-Item -LiteralPath $TargetPath).VersionInfo.ProductVersion
@@ -176,6 +203,36 @@ try {
         if ($HadPreviousVersion -and (Test-Path -LiteralPath $BackupPath -PathType Leaf)) {
             Remove-Item -LiteralPath $TargetPath -Force -ErrorAction SilentlyContinue
             Move-Item -LiteralPath $BackupPath -Destination $TargetPath -Force
+        }
+        elseif (-not $HadPreviousVersion) {
+            Remove-Item -LiteralPath $TargetPath -Force -ErrorAction SilentlyContinue
+        }
+        if ($HadPreviousUninstaller) {
+            Copy-Item -LiteralPath $UninstallerBackup -Destination $InstalledUninstaller -Force -ErrorAction SilentlyContinue
+        }
+        else {
+            Remove-Item -LiteralPath $InstalledUninstaller -Force -ErrorAction SilentlyContinue
+        }
+        if ($HadPreviousMenuShortcut) {
+            Copy-Item -LiteralPath $MenuShortcutBackup -Destination $ShortcutPath -Force -ErrorAction SilentlyContinue
+        }
+        else {
+            Remove-Item -LiteralPath $ShortcutPath -Force -ErrorAction SilentlyContinue
+        }
+        if ($HadPreviousDesktopShortcut) {
+            Copy-Item -LiteralPath $DesktopShortcutBackup -Destination $DesktopShortcutPath -Force -ErrorAction SilentlyContinue
+        }
+        else {
+            Remove-Item -LiteralPath $DesktopShortcutPath -Force -ErrorAction SilentlyContinue
+        }
+        if ($HadPreviousUninstallKey -and $RegistryBackupCreated) {
+            & reg.exe import $RegistryBackup | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning 'Could not restore the previous uninstall registry entry.'
+            }
+        }
+        elseif (-not $HadPreviousUninstallKey) {
+            Remove-Item -LiteralPath $UninstallKey -Recurse -Force -ErrorAction SilentlyContinue
         }
         if ($StartupWasEnabled -and $ExistingStartup) {
             Set-ItemProperty -Path $RunKey -Name 'CodexUsage' -Value $ExistingStartup
