@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -18,7 +18,7 @@ use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::diagnose;
-use crate::localization::{self, LanguageId, Strings};
+use crate::localization::{self, LanguageId, SettingsText, Strings};
 use crate::models::{AppUsageData, UsageData};
 use crate::native_interop::{
     self, Color, TIMER_CODEX_LOGIN, TIMER_COUNTDOWN, TIMER_FRESHNESS, TIMER_POLL,
@@ -1269,8 +1269,39 @@ fn codex_auth_notice_body(strings: Strings, _account: &poller::CodexAccount) -> 
 }
 
 fn save_settings(settings: &SettingsFile) {
-    if let Err(error) = settings_store::save(&settings_path(), || Some(settings.clone())) {
-        diagnose::log_error("unable to save settings", error);
+    report_settings_save(settings_store::save(&settings_path(), || {
+        Some(settings.clone())
+    }));
+}
+
+// Notify once per failure streak; position and background updates can save often.
+static SETTINGS_SAVE_FAILED: AtomicBool = AtomicBool::new(false);
+
+fn report_settings_save(result: std::io::Result<()>) {
+    match result {
+        Ok(()) => SETTINGS_SAVE_FAILED.store(false, Ordering::Relaxed),
+        Err(error) => {
+            diagnose::log_error("unable to save settings", &error);
+            if !SETTINGS_SAVE_FAILED.swap(true, Ordering::Relaxed) {
+                let (hwnd, language) = {
+                    let state = lock_state();
+                    state.as_ref().map_or(
+                        (HWND::default(), localization::resolve_language(None)),
+                        |s| (s.hwnd.to_hwnd(), s.language),
+                    )
+                };
+                show_error_message(
+                    hwnd,
+                    language.strings().settings,
+                    &format!(
+                        "{}\n\n{}\n\n{}",
+                        SettingsText::SaveFailed.text(language),
+                        settings_path().display(),
+                        error
+                    ),
+                );
+            }
+        }
     }
 }
 
@@ -1305,9 +1336,7 @@ fn save_state_settings() {
             active_codex_account: s.active_codex_account,
         })
     });
-    if let Err(error) = result {
-        diagnose::log_error("unable to save settings", error);
-    }
+    report_settings_save(result);
 }
 
 fn format_precise_reset_time(resets_at: Option<SystemTime>) -> Option<String> {
@@ -1346,10 +1375,8 @@ fn claude_code_menu_label(
 ) -> String {
     if claude_code_available {
         strings.claude_code_model.to_string()
-    } else if language == LanguageId::SimplifiedChinese {
-        "Claude Code（需登录 CLI）".to_string()
     } else {
-        "Claude Code (CLI login required)".to_string()
+        SettingsText::ClaudeLogin.text(language).to_string()
     }
 }
 
@@ -2428,7 +2455,10 @@ fn migrate_legacy_startup_entry() {
     }
 
     if should_write_migrated_startup(legacy_exists, current_exists) {
-        set_startup_enabled(true);
+        if let Err(error) = set_startup_enabled(true) {
+            diagnose::log_error("unable to migrate startup setting", error);
+            return;
+        }
     }
 
     if read_startup_value(STARTUP_REGISTRY_KEY).is_some() {
@@ -2441,7 +2471,14 @@ fn should_write_migrated_startup(legacy_exists: bool, current_exists: bool) -> b
     legacy_exists && !current_exists
 }
 
-fn set_startup_enabled(enable: bool) {
+fn set_startup_enabled(enable: bool) -> Result<(), String> {
+    let command = if enable {
+        let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+        Some(native_interop::wide_str(&format!("\"{}\"", exe.display())))
+    } else {
+        None
+    };
+    // SAFETY: Registry handles and UTF-16 buffers remain valid through each call.
     unsafe {
         let path = native_interop::wide_str(STARTUP_REGISTRY_PATH);
 
@@ -2454,39 +2491,38 @@ fn set_startup_enabled(enable: bool) {
             &mut hkey,
         );
         if result.is_err() {
-            return;
+            return Err(std::io::Error::from_raw_os_error(result.0 as i32).to_string());
         }
 
         let key_name = native_interop::wide_str(STARTUP_REGISTRY_KEY);
 
-        if enable {
-            let mut exe_buf = [0u16; 260];
-            let len = GetModuleFileNameW(None, &mut exe_buf) as usize;
-            if len > 0 {
-                // Quoting also supports installation paths containing spaces.
-                let command = native_interop::wide_str(&format!(
-                    "\"{}\"",
-                    String::from_utf16_lossy(&exe_buf[..len])
-                ));
-                let byte_len = (command.len() * 2) as u32;
-                let _ = RegSetValueExW(
-                    hkey,
-                    PCWSTR::from_raw(key_name.as_ptr()),
-                    0,
-                    REG_SZ,
-                    Some(std::slice::from_raw_parts(
-                        command.as_ptr() as *const u8,
-                        byte_len as usize,
-                    )),
-                );
-            }
+        let result = if let Some(command) = command {
+            RegSetValueExW(
+                hkey,
+                PCWSTR::from_raw(key_name.as_ptr()),
+                0,
+                REG_SZ,
+                Some(std::slice::from_raw_parts(
+                    command.as_ptr() as *const u8,
+                    command.len() * 2,
+                )),
+            )
+            .ok()
+            .map_err(|error| error.to_string())
         } else {
-            let _ = RegDeleteValueW(hkey, PCWSTR::from_raw(key_name.as_ptr()));
             let legacy_key_name = native_interop::wide_str(LEGACY_STARTUP_REGISTRY_KEY);
-            let _ = RegDeleteValueW(hkey, PCWSTR::from_raw(legacy_key_name.as_ptr()));
-        }
+            let mut result = Ok(());
+            for key in [&key_name, &legacy_key_name] {
+                let status = RegDeleteValueW(hkey, PCWSTR::from_raw(key.as_ptr()));
+                if status.is_err() && status != ERROR_FILE_NOT_FOUND && result.is_ok() {
+                    result = Err(std::io::Error::from_raw_os_error(status.0 as i32).to_string());
+                }
+            }
+            result
+        };
 
         let _ = RegCloseKey(hkey);
+        result
     }
 }
 
@@ -4747,6 +4783,7 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_RBUTTONUP => {
+            diagnose::log("widget received right-button release");
             show_context_menu(hwnd);
             LRESULT(0)
         }
@@ -4851,7 +4888,21 @@ unsafe extern "system" fn wnd_proc(
                     }
                 }
                 IDM_START_WITH_WINDOWS => {
-                    set_startup_enabled(!is_startup_enabled());
+                    if let Err(error) = set_startup_enabled(!is_startup_enabled()) {
+                        diagnose::log_error("unable to change startup setting", &error);
+                        let language = lock_state()
+                            .as_ref()
+                            .map_or(LanguageId::English, |s| s.language);
+                        show_error_message(
+                            hwnd,
+                            language.strings().start_with_windows,
+                            &format!(
+                                "{}\n\n{}",
+                                SettingsText::StartupFailed.text(language),
+                                error
+                            ),
+                        );
+                    }
                 }
                 IDM_FREQ_1MIN | IDM_FREQ_5MIN | IDM_FREQ_15MIN | IDM_FREQ_1HOUR => {
                     let new_interval = match id {
@@ -5180,6 +5231,20 @@ unsafe extern "system" fn wnd_proc(
     }
 }
 
+fn menu_summary(label: &str, value: &str) -> String {
+    menu_text(&format!("{label}: {value}"))
+}
+
+fn quota_alert_label(language: LanguageId, threshold: u8) -> String {
+    if threshold == 0 {
+        SettingsText::Off.text(language).to_string()
+    } else {
+        SettingsText::Remaining
+            .text(language)
+            .replace("{percent}", &threshold.to_string())
+    }
+}
+
 unsafe fn append_appearance_choice(menu: HMENU, id: u16, selected: bool, label: &str) {
     let wide = native_interop::wide_str(label);
     let flags = if selected {
@@ -5191,7 +5256,7 @@ unsafe fn append_appearance_choice(menu: HMENU, id: u16, selected: bool, label: 
 }
 
 unsafe fn append_appearance_submenu(parent: HMENU, child: HMENU, label: &str) {
-    let wide = native_interop::wide_str(label);
+    let wide = native_interop::wide_str(&menu_text(label));
     let _ = AppendMenuW(
         parent,
         MF_POPUP,
@@ -5200,7 +5265,7 @@ unsafe fn append_appearance_submenu(parent: HMENU, child: HMENU, label: &str) {
     );
 }
 
-fn show_context_menu(hwnd: HWND) {
+fn create_context_menu() -> HMENU {
     unsafe {
         let (
             current_interval,
@@ -5259,6 +5324,11 @@ fn show_context_menu(hwnd: HWND) {
         };
 
         let menu = CreatePopupMenu().unwrap();
+        let accounts_services_menu = CreatePopupMenu().unwrap();
+        let monitoring_menu = CreatePopupMenu().unwrap();
+        let appearance_menu = CreatePopupMenu().unwrap();
+        let taskbar_menu = CreatePopupMenu().unwrap();
+        let text = |key: SettingsText| key.text(language);
 
         let refresh_str = native_interop::wide_str(strings.refresh);
         let _ = AppendMenuW(
@@ -5291,30 +5361,24 @@ fn show_context_menu(hwnd: HWND) {
             );
         }
 
-        let adaptive = lock_state().as_ref().is_some_and(|s| s.adaptive_refresh);
-        let adaptive_label =
-            native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
-                "剩余 ≤20% 时每分钟刷新"
-            } else {
-                "Refresh every minute when remaining ≤20%"
-            });
-        let _ = AppendMenuW(freq_menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let interval_label = freq_items
+            .iter()
+            .find(|(_, interval, _)| *interval == current_interval)
+            .map_or(strings.fifteen_minutes, |(_, _, label)| *label);
+        let freq_label =
+            native_interop::wide_str(&menu_summary(strings.update_frequency, interval_label));
         let _ = AppendMenuW(
-            freq_menu,
-            if adaptive {
-                MF_CHECKED
-            } else {
-                MENU_ITEM_FLAGS(0)
-            },
-            IDM_ADAPTIVE_REFRESH as usize,
-            PCWSTR::from_raw(adaptive_label.as_ptr()),
-        );
-        let freq_label = native_interop::wide_str(strings.update_frequency);
-        let _ = AppendMenuW(
-            menu,
+            monitoring_menu,
             MF_POPUP,
             freq_menu.0 as usize,
             PCWSTR::from_raw(freq_label.as_ptr()),
+        );
+        let adaptive = lock_state().as_ref().is_some_and(|s| s.adaptive_refresh);
+        append_appearance_choice(
+            monitoring_menu,
+            IDM_ADAPTIVE_REFRESH,
+            adaptive,
+            text(SettingsText::Adaptive),
         );
 
         // Models submenu
@@ -5363,7 +5427,7 @@ fn show_context_menu(hwnd: HWND) {
 
         let models_label = native_interop::wide_str(strings.models);
         let _ = AppendMenuW(
-            menu,
+            accounts_services_menu,
             MF_POPUP,
             models_menu.0 as usize,
             PCWSTR::from_raw(models_label.as_ptr()),
@@ -5476,9 +5540,15 @@ fn show_context_menu(hwnd: HWND) {
                     );
                 }
             }
-            let accounts_label = native_interop::wide_str(account_strings.menu);
+            let active_label = codex_account_labels
+                .get(codex_active_account)
+                .map_or("", |label| label.as_str());
+            let accounts_label = native_interop::wide_str(&menu_summary(
+                account_strings.menu,
+                &truncate_label(active_label),
+            ));
             let _ = AppendMenuW(
-                menu,
+                accounts_services_menu,
                 MF_POPUP,
                 accounts_menu.0 as usize,
                 PCWSTR::from_raw(accounts_label.as_ptr()),
@@ -5487,12 +5557,7 @@ fn show_context_menu(hwnd: HWND) {
 
         // Usage window visibility submenu. Keep at least one window enabled.
         let usage_menu = CreatePopupMenu().unwrap();
-        let session_label =
-            native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
-                "5 小时额度"
-            } else {
-                "5-hour quota"
-            });
+        let session_label = native_interop::wide_str(text(SettingsText::Session));
         let session_flags = if show_session_window {
             MF_CHECKED
         } else {
@@ -5504,11 +5569,7 @@ fn show_context_menu(hwnd: HWND) {
             IDM_SHOW_SESSION_WINDOW as usize,
             PCWSTR::from_raw(session_label.as_ptr()),
         );
-        let weekly_label = native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
-            "每周额度"
-        } else {
-            "Weekly quota"
-        });
+        let weekly_label = native_interop::wide_str(text(SettingsText::Weekly));
         let weekly_flags = if show_weekly_window {
             MF_CHECKED
         } else {
@@ -5520,39 +5581,25 @@ fn show_context_menu(hwnd: HWND) {
             IDM_SHOW_WEEKLY_WINDOW as usize,
             PCWSTR::from_raw(weekly_label.as_ptr()),
         );
-        let usage_label = native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
-            "显示用量"
-        } else {
-            "Usage display"
-        });
+        let usage_label = native_interop::wide_str(text(SettingsText::Usage));
         let _ = AppendMenuW(
-            menu,
+            appearance_menu,
             MF_POPUP,
             usage_menu.0 as usize,
             PCWSTR::from_raw(usage_label.as_ptr()),
         );
 
-        let chinese = language == LanguageId::SimplifiedChinese;
-        let appearance_menu = CreatePopupMenu().unwrap();
         append_appearance_choice(
             appearance_menu,
             IDM_APPEARANCE_RECOMMENDED,
             appearance == Appearance::translucent_dark_taskbar(),
-            if chinese {
-                "推荐：半透明深色任务栏"
-            } else {
-                "Recommended: translucent dark taskbar"
-            },
+            text(SettingsText::Recommended),
         );
         append_appearance_choice(
             appearance_menu,
             IDM_APPEARANCE_RESET,
             appearance == Appearance::default(),
-            if chinese {
-                "恢复默认外观"
-            } else {
-                "Reset appearance"
-            },
+            text(SettingsText::ResetAppearance),
         );
         let _ = AppendMenuW(appearance_menu, MF_SEPARATOR, 0, PCWSTR::null());
         let palette_menu = CreatePopupMenu().unwrap();
@@ -5560,90 +5607,54 @@ fn show_context_menu(hwnd: HWND) {
             palette_menu,
             IDM_PALETTE_SYSTEM,
             appearance.palette == Palette::System,
-            if chinese {
-                "跟随系统"
-            } else {
-                "Follow system"
-            },
+            text(SettingsText::System),
         );
         append_appearance_choice(
             palette_menu,
             IDM_PALETTE_DARK,
             appearance.palette == Palette::HighContrastDark,
-            if chinese {
-                "高对比深色"
-            } else {
-                "High contrast dark"
-            },
+            text(SettingsText::Dark),
         );
         append_appearance_choice(
             palette_menu,
             IDM_PALETTE_LIGHT,
             appearance.palette == Palette::HighContrastLight,
-            if chinese {
-                "高对比浅色"
-            } else {
-                "High contrast light"
-            },
+            text(SettingsText::Light),
         );
-        append_appearance_submenu(
-            appearance_menu,
-            palette_menu,
-            if chinese {
-                "文字与颜色"
-            } else {
-                "Text and colors"
-            },
-        );
+        append_appearance_submenu(appearance_menu, palette_menu, text(SettingsText::Colors));
 
         let style_menu = CreatePopupMenu().unwrap();
         append_appearance_choice(
             style_menu,
             IDM_BAR_CONTINUOUS,
             appearance.bar_style == BarStyle::Continuous,
-            if chinese {
-                "连续圆角"
-            } else {
-                "Continuous rounded"
-            },
+            text(SettingsText::Continuous),
         );
         append_appearance_choice(
             style_menu,
             IDM_BAR_SEGMENTED,
             appearance.bar_style == BarStyle::Segmented,
-            if chinese { "分段" } else { "Segmented" },
+            text(SettingsText::Segmented),
         );
-        append_appearance_submenu(
-            appearance_menu,
-            style_menu,
-            if chinese {
-                "进度条样式"
-            } else {
-                "Bar style"
-            },
-        );
+        append_appearance_submenu(appearance_menu, style_menu, text(SettingsText::BarStyle));
 
         let thickness_menu = CreatePopupMenu().unwrap();
         append_appearance_choice(
             thickness_menu,
             IDM_BAR_STANDARD,
             appearance.bar_thickness == BarThickness::Standard,
-            if chinese { "标准" } else { "Standard" },
+            text(SettingsText::Standard),
         );
         append_appearance_choice(
             thickness_menu,
             IDM_BAR_SLIM,
             appearance.bar_thickness == BarThickness::Slim,
-            if chinese { "细" } else { "Slim" },
+            text(SettingsText::Slim),
         );
         append_appearance_submenu(
             appearance_menu,
             thickness_menu,
-            if chinese {
-                "进度条粗细"
-            } else {
-                "Bar thickness"
-            },
+            text(SettingsText::Thickness),
         );
 
         let font_menu = CreatePopupMenu().unwrap();
@@ -5651,67 +5662,25 @@ fn show_context_menu(hwnd: HWND) {
             font_menu,
             IDM_FONT_STANDARD,
             appearance.font_size == FontSize::Standard,
-            if chinese { "标准" } else { "Standard" },
+            text(SettingsText::Standard),
         );
         append_appearance_choice(
             font_menu,
             IDM_FONT_LARGE,
             appearance.font_size == FontSize::Large,
-            if chinese { "较大" } else { "Larger" },
+            text(SettingsText::Larger),
         );
-        append_appearance_submenu(
-            appearance_menu,
-            font_menu,
-            if chinese { "文字大小" } else { "Text size" },
-        );
-        append_appearance_submenu(
-            menu,
-            appearance_menu,
-            if chinese { "外观" } else { "Appearance" },
-        );
-
+        append_appearance_submenu(appearance_menu, font_menu, text(SettingsText::TextSize));
         // Low-quota alert threshold submenu. Zero means opt-out.
         let alert_menu = CreatePopupMenu().unwrap();
         let alert_items = [
-            (
-                IDM_ALERT_OFF,
-                0u8,
-                if language == LanguageId::SimplifiedChinese {
-                    "关闭"
-                } else {
-                    "Off"
-                },
-            ),
-            (
-                IDM_ALERT_10,
-                10u8,
-                if language == LanguageId::SimplifiedChinese {
-                    "剩余 10%"
-                } else {
-                    "10% remaining"
-                },
-            ),
-            (
-                IDM_ALERT_20,
-                20u8,
-                if language == LanguageId::SimplifiedChinese {
-                    "剩余 20%"
-                } else {
-                    "20% remaining"
-                },
-            ),
-            (
-                IDM_ALERT_30,
-                30u8,
-                if language == LanguageId::SimplifiedChinese {
-                    "剩余 30%"
-                } else {
-                    "30% remaining"
-                },
-            ),
+            (IDM_ALERT_OFF, 0u8),
+            (IDM_ALERT_10, 10),
+            (IDM_ALERT_20, 20),
+            (IDM_ALERT_30, 30),
         ];
-        for (id, threshold, label) in alert_items {
-            let label = native_interop::wide_str(label);
+        for (id, threshold) in alert_items {
+            let label = native_interop::wide_str(&quota_alert_label(language, threshold));
             let flags = if alert_threshold_percent == threshold {
                 MF_CHECKED
             } else {
@@ -5724,13 +5693,12 @@ fn show_context_menu(hwnd: HWND) {
                 PCWSTR::from_raw(label.as_ptr()),
             );
         }
-        let alert_label = native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
-            "额度提醒"
-        } else {
-            "Quota alerts"
-        });
+        let alert_label = native_interop::wide_str(&menu_summary(
+            text(SettingsText::Alerts),
+            &quota_alert_label(language, alert_threshold_percent),
+        ));
         let _ = AppendMenuW(
-            menu,
+            monitoring_menu,
             MF_POPUP,
             alert_menu.0 as usize,
             PCWSTR::from_raw(alert_label.as_ptr()),
@@ -5753,13 +5721,9 @@ fn show_context_menu(hwnd: HWND) {
         );
 
         let anchored = lock_state().as_ref().is_some_and(|s| s.anchor_left);
-        let left_label = native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
-            "固定在任务栏最左侧"
-        } else {
-            "Pin to the left edge of the taskbar"
-        });
+        let left_label = native_interop::wide_str(text(SettingsText::PinLeft));
         let _ = AppendMenuW(
-            settings_menu,
+            taskbar_menu,
             if anchored {
                 MF_CHECKED
             } else {
@@ -5770,7 +5734,7 @@ fn show_context_menu(hwnd: HWND) {
         );
         let reset_pos_str = native_interop::wide_str(strings.reset_position);
         let _ = AppendMenuW(
-            settings_menu,
+            taskbar_menu,
             MENU_ITEM_FLAGS(0),
             IDM_RESET_POSITION as usize,
             PCWSTR::from_raw(reset_pos_str.as_ptr()),
@@ -5786,11 +5750,7 @@ fn show_context_menu(hwnd: HWND) {
             for (index, taskbar) in taskbars.iter().take(MAX_MONITOR_MENU_ITEMS).enumerate() {
                 let device = native_interop::taskbar_monitor_device(taskbar)
                     .unwrap_or_else(|| format!("{}", index + 1));
-                let label = if language == LanguageId::SimplifiedChinese {
-                    format!("显示器 {} ({device})", index + 1)
-                } else {
-                    format!("Display {} ({device})", index + 1)
-                };
+                let label = format!("{} {} ({device})", text(SettingsText::Display), index + 1);
                 let wide = native_interop::wide_str(&label);
                 let flags = if selected_taskbar == Some(taskbar.hwnd) {
                     MF_CHECKED
@@ -5804,13 +5764,9 @@ fn show_context_menu(hwnd: HWND) {
                     PCWSTR::from_raw(wide.as_ptr()),
                 );
             }
-            let label = native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
-                "显示器"
-            } else {
-                "Display"
-            });
+            let label = native_interop::wide_str(text(SettingsText::Display));
             let _ = AppendMenuW(
-                settings_menu,
+                taskbar_menu,
                 MF_POPUP,
                 monitor_menu.0 as usize,
                 PCWSTR::from_raw(label.as_ptr()),
@@ -5887,13 +5843,15 @@ fn show_context_menu(hwnd: HWND) {
             PCWSTR::from_raw(version_str.as_ptr()),
         );
 
-        let settings_label = native_interop::wide_str(strings.settings);
-        let _ = AppendMenuW(
-            menu,
-            MF_POPUP,
-            settings_menu.0 as usize,
-            PCWSTR::from_raw(settings_label.as_ptr()),
-        );
+        for (child, label) in [
+            (accounts_services_menu, SettingsText::Accounts),
+            (monitoring_menu, SettingsText::Monitoring),
+            (appearance_menu, SettingsText::Appearance),
+            (taskbar_menu, SettingsText::Taskbar),
+            (settings_menu, SettingsText::Preferences),
+        ] {
+            append_appearance_submenu(menu, child, text(label));
+        }
 
         let widget_label = native_interop::wide_str(strings.show_widget);
         let widget_flags = if widget_visible {
@@ -5918,11 +5876,79 @@ fn show_context_menu(hwnd: HWND) {
             PCWSTR::from_raw(exit_str.as_ptr()),
         );
 
+        menu
+    }
+}
+
+fn create_context_menu_owner(pt: POINT) -> windows::core::Result<HWND> {
+    // SAFETY: STATIC is a system window class. This creates an unowned,
+    // zero-sized top-level window on the calling UI thread, with no Rust pointers.
+    unsafe {
+        CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            windows::core::w!("STATIC"),
+            windows::core::w!("Codex Usage menu owner"),
+            WS_POPUP,
+            pt.x,
+            pt.y,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+}
+
+fn show_context_menu(hwnd: HWND) {
+    let menu = create_context_menu();
+    // A taskbar child cannot be the foreground window: activation targets
+    // Explorer instead, and Search can cancel its popup menu. Use our own
+    // top-level window for the menu loop, then dispatch the selected command
+    // back to the widget after the menu and its owner have been destroyed.
+    // SAFETY: All handles are created and used on the UI thread. No pointers
+    // are retained by the posted command, and STATIC uses the system wndproc.
+    unsafe {
         let mut pt = POINT::default();
-        let _ = GetCursorPos(&mut pt);
-        let _ = SetForegroundWindow(hwnd);
-        let _ = TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, None);
-        let _ = DestroyMenu(menu);
+        if let Err(error) = GetCursorPos(&mut pt) {
+            diagnose::log_error("unable to locate context menu", error);
+            let _ = DestroyMenu(menu);
+            return;
+        }
+        let owner = match create_context_menu_owner(pt) {
+            Ok(owner) => owner,
+            Err(error) => {
+                diagnose::log_error("unable to create context menu owner", error);
+                let _ = DestroyMenu(menu);
+                return;
+            }
+        };
+        let _ = ShowWindow(owner, SW_SHOWNOACTIVATE);
+        let foreground = SetForegroundWindow(owner).as_bool();
+        diagnose::log(format!("context menu owner activated={foreground}"));
+        let command = TrackPopupMenu(
+            menu,
+            TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+            pt.x,
+            pt.y,
+            0,
+            owner,
+            None,
+        );
+        if let Err(error) = DestroyMenu(menu) {
+            diagnose::log_error("unable to destroy context menu", error);
+        }
+        if let Err(error) = DestroyWindow(owner) {
+            diagnose::log_error("unable to destroy context menu owner", error);
+        }
+        if command.0 != 0 {
+            if let Err(error) =
+                PostMessageW(hwnd, WM_COMMAND, WPARAM(command.0 as usize), LPARAM(0))
+            {
+                diagnose::log_error("unable to dispatch context menu command", error);
+            }
+        }
     }
 }
 
@@ -6434,6 +6460,76 @@ mod tests {
   "show_antigravity": false
 }}"#
         )
+    }
+
+    #[test]
+    fn context_menu_owner_is_an_activatable_top_level_tool_window() {
+        let owner = create_context_menu_owner(POINT { x: 0, y: 0 }).unwrap();
+        // SAFETY: This test owns the window and destroys it on the creating thread.
+        unsafe {
+            assert_eq!(GetAncestor(owner, GA_ROOT), owner);
+            assert!(GetParent(owner).is_err());
+            let style = GetWindowLongW(owner, GWL_STYLE) as u32;
+            assert_ne!(style & WS_POPUP.0, 0);
+            assert_eq!(style & WS_CHILD.0, 0);
+            let ex_style = GetWindowLongW(owner, GWL_EXSTYLE) as u32;
+            assert_ne!(ex_style & WS_EX_TOOLWINDOW.0, 0);
+            assert_eq!(ex_style & WS_EX_NOACTIVATE.0, 0);
+            DestroyWindow(owner).unwrap();
+        }
+    }
+
+    #[test]
+    fn settings_summaries_escape_account_names_and_describe_remaining_quota() {
+        assert_eq!(
+            menu_summary("Codex accounts", "Work & personal"),
+            "Codex accounts: Work && personal"
+        );
+        assert_eq!(quota_alert_label(LanguageId::English, 0), "Off");
+        for threshold in [10, 20, 30] {
+            assert_eq!(
+                quota_alert_label(LanguageId::English, threshold),
+                format!("{threshold}% remaining")
+            );
+        }
+    }
+
+    #[test]
+    fn native_settings_menu_groups_commands_without_losing_actions() {
+        let menu = create_context_menu();
+        // SAFETY: The menu and its submenus are alive until DestroyMenu below.
+        unsafe {
+            assert_eq!(GetMenuItemCount(menu), 9);
+            let accounts = GetSubMenu(menu, 1);
+            let monitoring = GetSubMenu(menu, 2);
+            let appearance = GetSubMenu(menu, 3);
+            let taskbar = GetSubMenu(menu, 4);
+            let preferences = GetSubMenu(menu, 5);
+            let services = GetSubMenu(accounts, 0);
+            assert_eq!(GetMenuItemID(services, 0), u32::from(IDM_MODEL_CLAUDE_CODE));
+            assert_eq!(GetMenuItemID(services, 1), u32::from(IDM_MODEL_CODEX));
+            assert_eq!(GetMenuItemID(services, 2), u32::from(IDM_MODEL_ANTIGRAVITY));
+            assert_eq!(GetMenuItemCount(monitoring), 3);
+            assert_eq!(
+                GetMenuItemID(monitoring, 1),
+                u32::from(IDM_ADAPTIVE_REFRESH)
+            );
+            let frequency = GetSubMenu(monitoring, 0);
+            assert_eq!(GetMenuItemCount(frequency), 4);
+            let alerts = GetSubMenu(monitoring, 2);
+            assert_eq!(GetMenuItemCount(alerts), 4);
+            let usage = GetSubMenu(appearance, 0);
+            assert_eq!(GetMenuItemID(usage, 0), u32::from(IDM_SHOW_SESSION_WINDOW));
+            assert_eq!(GetMenuItemID(usage, 1), u32::from(IDM_SHOW_WEEKLY_WINDOW));
+            assert_eq!(GetMenuItemID(taskbar, 0), u32::from(IDM_ANCHOR_LEFT));
+            assert_eq!(GetMenuItemID(taskbar, 1), u32::from(IDM_RESET_POSITION));
+            assert_eq!(
+                GetMenuItemID(preferences, 0),
+                u32::from(IDM_START_WITH_WINDOWS)
+            );
+            assert_eq!(GetMenuItemID(preferences, 3), u32::from(IDM_VERSION_ACTION));
+            DestroyMenu(menu).unwrap();
+        }
     }
 
     #[test]

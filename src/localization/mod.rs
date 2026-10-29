@@ -6,10 +6,12 @@ mod japanese;
 mod korean;
 mod portuguese_brazil;
 mod russian;
+mod settings;
 mod simplified_chinese;
 mod spanish;
 mod traditional_chinese;
 
+pub use settings::SettingsText;
 use windows::core::PWSTR;
 use windows::Win32::Globalization::{
     GetUserDefaultLocaleName, GetUserDefaultUILanguage, GetUserPreferredUILanguages,

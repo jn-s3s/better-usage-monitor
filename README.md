@@ -43,7 +43,7 @@ This app is for Windows users who already have **Codex CLI or the Codex app inst
 
 Codex is enabled by default. The app reads the same local credentials used by Codex.
 
-Antigravity support is optional too. To show Antigravity usage, install and sign in to Google Antigravity, then enable the **Antigravity** service from the right-click **Monitored services** menu.
+Antigravity support is optional too. To show Antigravity usage, install and sign in to Google Antigravity, then enable the **Antigravity** service from the right-click **Accounts & services → Monitored services** menu.
 
 It works best if you want a simple "how close am I to the limit?" display that is always visible.
 
@@ -116,15 +116,17 @@ codex-usage
 Once running, it will appear in your taskbar and as one tray icon in the notification area.
 
 - Drag the left divider to move the taskbar widget
-- Choose **Settings → Pin to the left edge of the taskbar** to keep the widget at the left edge instead of next to the tray
-- On multi-monitor setups, choose **Settings → Display** from the right-click menu or drag the widget onto another taskbar. The selection is saved; the primary taskbar is used while the selected display is disconnected, and the widget returns when it reconnects.
-- Right-click the taskbar widget or tray icon for refresh, monitored services, usage rows, quota alerts, update frequency, Start with Windows, reset position, language, updates, and exit
+- Choose **Taskbar → Pin to the left edge of the taskbar** to keep the widget at the left edge instead of next to the tray
+- On multi-monitor setups, choose **Taskbar → Display** from the right-click menu or drag the widget onto another taskbar. The selection is saved; the primary taskbar is used while the selected display is disconnected, and the widget returns when it reconnects.
+- Right-click the taskbar widget or tray icon for **Accounts & services**, **Monitoring**, **Appearance**, **Taskbar**, and **Preferences**. Refresh, widget visibility, and exit remain directly accessible.
 - Left-click the tray icon to toggle the taskbar widget on or off
-- Enable `Start with Windows` from the right-click menu if you want it to launch automatically when you sign in
+- Enable **Preferences → Start with Windows** if you want it to launch automatically when you sign in
+
+The refresh interval, quota-alert threshold, and selected Codex account appear in their submenu labels. If settings cannot be saved, the app shows the file path and error once until a save succeeds. Check folder permissions and free space, then change a setting to retry. Startup-setting failures also show an error; the checkmark reflects the registered startup command.
 
 ### Monitored Services
 
-Use the right-click **Monitored services** menu to choose which independent services the widget displays. The services are not mutually exclusive, so you can monitor more than one account at the same time:
+Use the right-click **Accounts & services → Monitored services** menu to choose which independent services the widget displays. The services are not mutually exclusive, so you can monitor more than one account at the same time:
 
 - **Codex** is enabled by default
 - **Claude Code** can be enabled alongside Codex or shown by itself when Claude Code CLI is installed and authenticated
@@ -136,7 +138,7 @@ Claude Desktop and Claude Code CLI use separate local sessions. Signing in to Cl
 
 ### Multiple Codex Accounts
 
-The widget shows one Codex login at a time. Right-click the widget or the tray icon and open **Codex accounts** to manage the rest:
+The widget shows one Codex login at a time. Right-click the widget or the tray icon and open **Accounts & services → Codex accounts** to manage the rest:
 
 - **Add account…** starts `codex login` for a new profile folder (`~/.codex-account2`, `~/.codex-account3`, …) and then waits for its credentials. The Codex CLI opens its own console and your browser: finish the sign-in there and the login is added and selected automatically. Nothing is added when the sign-in does not finish within five minutes. Up to 39 Codex logins (including the default) can be monitored, so once that many are configured this menu entry reports the limit instead of starting a sign-in; extra entries in `codex_accounts` are ignored.
 - While that sign-in is running, the same menu entry reads **Stop waiting for sign-in**. This stops the monitor's wait, not the CLI or browser. Close abandoned Codex windows yourself.
@@ -208,9 +210,9 @@ Hovering over the tray icon shows a compact summary for all enabled services, wi
 
 ### Usage Display And Alerts
 
-Use the right-click **Usage display** menu to show both quota rows or only one. The app always keeps at least one row visible.
+Use the right-click **Appearance → Usage windows** menu to show both quota rows or only one. The app always keeps at least one row visible.
 
-Use **Quota alerts** to choose a remaining-quota threshold of 10%, 20%, or 30%. Alerts are off by default. Each provider and quota window is notified only once until its reset time changes, including across app restarts. Codex alerts follow the login the widget displays: the other configured logins are still polled for their numbers but do not raise alerts of their own.
+Use **Monitoring → Quota alerts** to choose a remaining-quota threshold of 10%, 20%, or 30%. Alerts are off by default. Each provider and quota window is notified only once until its reset time changes, including across app restarts. Codex alerts follow the login the widget displays: the other configured logins are still polled for their numbers but do not raise alerts of their own.
 
 In Simplified Chinese, the compact taskbar rows use `5h` / `7d`, remaining percentage, and a concrete local reset value such as `18:30重置` or `07/17重置`.
 
@@ -230,7 +232,7 @@ Hover over a service column to see when it last updated successfully, when it re
 
 Refresh behavior:
 
-- **Update frequency** sets the normal interval. **Refresh every minute when remaining ≤20%** is on by default. It refreshes a service every minute while one of its quota windows has 20% or less left. A service with a used-up window keeps the normal interval, because it cannot use more quota until the reset.
+- Under **Monitoring**, **Update frequency** sets the normal interval. **Refresh every minute when remaining ≤20%** is on by default. It refreshes a service every minute while one of its quota windows has 20% or less left. A service with a used-up window keeps the normal interval, because it cannot use more quota until the reset.
 - Network and server errors retry with increasing delays. When a server answers `429` with a `Retry-After` time, the app waits until that time.
 - When a login expires or credentials are missing, the app stops retrying that service until its credentials file changes or you choose **Refresh**.
 - Shortly after a quota window resets, the app checks again so the new window shows quickly.
