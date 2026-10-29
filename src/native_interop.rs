@@ -109,6 +109,21 @@ pub fn find_taskbars() -> Vec<TaskbarWindow> {
     unsafe {
         let _ = EnumWindows(Some(enum_proc), LPARAM(&mut taskbars as *mut _ as isize));
     }
+    // Start/Search can move the primary taskbar into a shell Z-order band that
+    // EnumWindows omits. It still exists: direct class lookup can find it.
+    // SAFETY: The class name is a static, null-terminated UTF-16 string.
+    let primary = unsafe { FindWindowW(windows::core::w!("Shell_TrayWnd"), PCWSTR::null()) }
+        .ok()
+        .and_then(|hwnd| {
+            get_taskbar_rect(hwnd)
+                .or_else(|| get_window_rect_safe(hwnd))
+                .map(|rect| TaskbarWindow {
+                    hwnd,
+                    rect,
+                    is_primary: true,
+                })
+        });
+    include_primary_taskbar(&mut taskbars, primary);
     taskbars.sort_by_key(|taskbar| {
         (
             taskbar.rect.top,
@@ -118,6 +133,14 @@ pub fn find_taskbars() -> Vec<TaskbarWindow> {
         )
     });
     taskbars
+}
+
+fn include_primary_taskbar(taskbars: &mut Vec<TaskbarWindow>, primary: Option<TaskbarWindow>) {
+    if let Some(primary) = primary {
+        if !taskbars.iter().any(|taskbar| taskbar.hwnd == primary.hwnd) {
+            taskbars.push(primary);
+        }
+    }
 }
 
 /// Find a child window by class name
@@ -253,6 +276,37 @@ mod attachment_tests {
     use windows::core::w;
     use windows::Win32::Foundation::{COLORREF, POINT, SIZE};
     use windows::Win32::Graphics::Gdi::*;
+
+    #[test]
+    fn primary_taskbar_missing_from_enumeration_is_recovered_without_duplicates() {
+        // Distinct identity tokens only; these handles are never passed to Win32.
+        let mut primary_token = 0u8;
+        let mut secondary_token = 0u8;
+        let primary = TaskbarWindow {
+            hwnd: HWND(std::ptr::from_mut(&mut primary_token).cast()),
+            rect: RECT::default(),
+            is_primary: true,
+        };
+        let secondary = TaskbarWindow {
+            hwnd: HWND(std::ptr::from_mut(&mut secondary_token).cast()),
+            is_primary: false,
+            ..primary
+        };
+        let mut taskbars = vec![secondary];
+        include_primary_taskbar(&mut taskbars, Some(primary));
+        assert_eq!(taskbars.len(), 2);
+        assert_eq!(taskbars[1].hwnd, primary.hwnd);
+        include_primary_taskbar(&mut taskbars, Some(primary));
+        assert_eq!(taskbars.len(), 2);
+        include_primary_taskbar(&mut taskbars, None);
+        assert_eq!(taskbars.len(), 2);
+
+        let mut empty = Vec::new();
+        include_primary_taskbar(&mut empty, None);
+        assert!(empty.is_empty());
+        include_primary_taskbar(&mut empty, Some(primary));
+        assert_eq!(empty[0].hwnd, primary.hwnd);
+    }
 
     #[test]
     fn startup_popup_and_taskbar_switch_preserve_layered_rendering() {
